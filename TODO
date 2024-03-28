@@ -1,0 +1,2 @@
+- Query the /nix-cache-info endpoint and verify that the StoreDir is the same as the one in the machine running the agent.
+- Contribute an impl of Error back to narinfo crate.
