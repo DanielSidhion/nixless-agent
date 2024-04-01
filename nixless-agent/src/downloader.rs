@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use futures::StreamExt;
 use narinfo::NarInfo;
 use nix_core::to_nix32;
+use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
@@ -14,10 +15,14 @@ use tokio::{
 use tokio_util::io::{InspectWriter, StreamReader};
 use xz_decoder::XZDecoder;
 
+use crate::{fingerprint::Fingerprint, signing::CachePublicKeychain};
+
 pub struct Downloader {
     temp_download_location: PathBuf,
     cache_url: String,
+    cache_auth_token: Option<String>,
     existing_store_paths: HashSet<String>,
+    keychain: CachePublicKeychain,
 }
 
 pub enum DownloaderRequest {
@@ -66,12 +71,16 @@ impl Downloader {
     pub fn new(
         temp_download_location: PathBuf,
         cache_url: String,
+        cache_auth_token: Option<String>,
         existing_store_paths: HashSet<String>,
+        keychain: CachePublicKeychain,
     ) -> Self {
         Self {
             temp_download_location,
             cache_url,
+            cache_auth_token,
             existing_store_paths,
+            keychain,
         }
     }
 
@@ -81,7 +90,9 @@ impl Downloader {
         let task = tokio::spawn(downloader_task(
             self.temp_download_location,
             self.cache_url,
+            self.cache_auth_token,
             self.existing_store_paths,
+            self.keychain,
             input_rx,
         ));
 
@@ -95,10 +106,22 @@ impl Downloader {
 async fn downloader_task(
     temp_download_location: PathBuf,
     cache_url: String,
+    cache_auth_token: Option<String>,
     mut existing_store_paths: HashSet<String>,
+    keychain: CachePublicKeychain,
     mut input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    let mut default_headers = HeaderMap::new();
+
+    if let Some(token) = cache_auth_token {
+        let mut header_value = HeaderValue::from_str(&format!("bearer {}", token))?;
+        header_value.set_sensitive(true);
+        default_headers.insert("authorization", header_value);
+    }
+
+    let client = reqwest::Client::builder()
+        .default_headers(default_headers)
+        .build()?;
 
     loop {
         tokio::select! {
@@ -115,11 +138,12 @@ async fn downloader_task(
                                 continue;
                             }
 
-                            download_futures.push(download_one_nar(client.clone(), &temp_download_location, &cache_url, &path));
+                            download_futures.push(download_one_nar(client.clone(), &temp_download_location, &cache_url, &path, &keychain));
                         }
 
                         let download_futures = futures::stream::iter(download_futures);
                         // We need to collect from the stream into a Vec of Results first, because the stream doesn't allow us to directly convert from a Vec of Results into a Result of Vec.
+                        // TODO: make number of parallel downloads configurable.
                         let download_results: Result<Vec<_>, _> = download_futures.buffer_unordered(5).collect::<Vec<_>>().await.into_iter().collect();
 
                         let resp = match download_results {
@@ -158,6 +182,7 @@ async fn download_one_nar(
     download_dir: &PathBuf,
     cache_url: &str,
     store_path: &str,
+    keychain: &CachePublicKeychain,
 ) -> anyhow::Result<NarDownloadResult> {
     let narinfo_url: String;
 
@@ -218,12 +243,19 @@ async fn download_one_nar(
         ""
     };
 
+    if !nar_info.verify_fingerprint(keychain)? {
+        return Err(anyhow!(
+            "Couldn't verify the signature of the NAR we downloaded!"
+        ));
+    }
+
     // TODO: as an optimisation, if the NAR file already exists in the download location, check if its hash matches what we got. If it does, we can skip downloading entirely.
 
     let nardata_url = format!("{}/{}", cache_url, nar_info.url);
     let mut nar_path = download_dir.join(nar_info.url);
 
-    // TODO: create directories if needed to store nar_path.
+    // In case any of the parent paths don't exist, we create them.
+    std::fs::create_dir_all(nar_path.parent().unwrap())?;
 
     let resp = client
         .get(nardata_url)

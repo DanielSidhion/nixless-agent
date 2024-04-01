@@ -6,9 +6,10 @@ edition = "2021"
 [dependencies]
 actix-web = { version = "4", features = [ "rustls" ] }
 anyhow = "1"
+base64 = "0.22"
 caps = "0.5"
 clap = { version = "4", features = ["derive"] }
-data-encoding = "2.5"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
 fastrand = "2"
 futures = "0.3"
 # I read the source code and hereby confirm the code in v1.0.1 looks ok.

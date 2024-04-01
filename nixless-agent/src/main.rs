@@ -7,10 +7,13 @@ use actix_web::{
 use anyhow::anyhow;
 use clap::Parser;
 use downloader::{Downloader, StartedDownloader};
+use signing::CachePublicKeychain;
 use unpacker::{StartedUnpacker, Unpacker};
 
 mod downloader;
+mod fingerprint;
 mod process_init;
+mod signing;
 mod unpacker;
 
 async fn entry_point(
@@ -52,6 +55,10 @@ struct Args {
     /// Cache URL.
     #[arg(short, long)]
     cache_url: String,
+
+    /// Cache authorization token. Will be sent in an "Authorization" header on every request.
+    #[arg(long)]
+    cache_auth_token: Option<String>,
 }
 
 async fn probe_nix_store(store_path: &PathBuf) -> anyhow::Result<HashSet<String>> {
@@ -80,10 +87,14 @@ async fn probe_nix_store(store_path: &PathBuf) -> anyhow::Result<HashSet<String>
 async fn async_main(args: Args) -> anyhow::Result<()> {
     let existing_store_paths = probe_nix_store(&args.nix_store_path).await?;
 
+    let keychain = CachePublicKeychain::with_known_keys()?;
+
     let downloader = Downloader::new(
         args.temp_download_location,
         args.cache_url,
+        args.cache_auth_token,
         existing_store_paths,
+        keychain,
     );
     let downloader = downloader.start();
 
