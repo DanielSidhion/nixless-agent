@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use actix_web::{
     error::InternalError, guard::fn_guard, http::StatusCode, web, App, HttpRequest, HttpResponse,
@@ -85,11 +89,54 @@ async fn probe_nix_store(store_path: &PathBuf) -> anyhow::Result<HashSet<String>
 
 #[tokio::main]
 async fn async_main(args: Args) -> anyhow::Result<()> {
-    let existing_store_paths = probe_nix_store(&args.nix_store_path).await?;
+    let store_path_string = args.nix_store_path.canonicalize()?.to_str().ok_or_else(|| anyhow!("The nix store path given to us can't be represented as an UTF-8 string, but this is required!"))?.to_string();
+    let (resource, conn) = dbus_tokio::connection::new_system_sync()?;
+
+    let dbus_task = tokio::spawn(async move {
+        let err = resource.await;
+        // TODO: send signal to the rest of the application, or do something better here.
+        panic!("D-Bus got disconnected with the following error: {}", err);
+    });
+
+    let polkit_proxy = dbus::nonblock::Proxy::new(
+        "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        Duration::from_millis(1000),
+        conn.clone(),
+    );
+
+    let mut subject_details: HashMap<&str, dbus::arg::Variant<&str>> = HashMap::new();
+    let conn_name = conn.unique_name();
+    subject_details.insert("name", dbus::arg::Variant(&conn_name));
+    let action_details: HashMap<&str, &str> = HashMap::new();
+
+    let ((is_authorised, is_challenge, _details),): ((bool, bool, HashMap<String, String>),) =
+        polkit_proxy
+            .method_call(
+                "org.freedesktop.PolicyKit1.Authority",
+                "CheckAuthorization",
+                (
+                    ("system-bus-name", subject_details),
+                    "org.freedesktop.systemd1.manage-units",
+                    action_details,
+                    0u32,
+                    "",
+                ),
+            )
+            .await?;
+
+    // We'll never fully know if we are 100% authorised until we actually try to perform the action because we can't check if we're authorised for the particular service we want to start.
+    if !is_authorised && !is_challenge {
+        return Err(anyhow!(
+            "we are not authorized by polkit to start a system switch!"
+        ));
+    }
 
     let keychain = CachePublicKeychain::with_known_keys()?;
+    let existing_store_paths = probe_nix_store(&args.nix_store_path).await?;
 
     let downloader = Downloader::new(
+        store_path_string,
         args.temp_download_location,
         args.cache_url,
         args.cache_auth_token,

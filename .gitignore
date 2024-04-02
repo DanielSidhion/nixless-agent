@@ -3,4 +3,4 @@ graph.dot
 list.csv
 .direnv
 result
-curl_data
+curl_data*

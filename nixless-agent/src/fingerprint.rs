@@ -20,14 +20,16 @@ impl Fingerprint for NarInfo<'_> {
             })?
             .0;
 
-        let comma_separated_references: String = self
+        let mut comma_separated_references: String = self
             .references
             .iter()
             .map(|r| format!("{}/{}", store_path, r))
-            // TODO: replace the `.zip().flat_map()` with `intersperse_with` once it's stabilised.
+            // TODO: replace the `.zip().flat_map()` and the `pop()` call with `intersperse_with` once it's stabilised.
             .zip(repeat_with(|| ",".to_string()))
             .flat_map(|(a, b)| [a, b])
             .collect();
+        // TODO: remove this once `intersperse_with` is stabilised.
+        comma_separated_references.pop();
 
         let fingerprint = format!(
             "1;{store_path};{nar_hash};{nar_size};{references}",

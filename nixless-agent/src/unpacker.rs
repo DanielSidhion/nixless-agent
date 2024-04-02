@@ -1,14 +1,14 @@
 use std::{
     fs::{read_dir, File},
     iter::repeat_with,
-    os::unix::fs::{chown, lchown},
+    os::unix::fs::lchown,
     path::PathBuf,
     time::SystemTime,
 };
 
 use anyhow::anyhow;
 use nix::sys::{
-    stat::{lstat, utimensat, UtimensatFlags},
+    stat::{utimensat, UtimensatFlags},
     time::TimeSpec,
 };
 use nix_nar::Decoder;

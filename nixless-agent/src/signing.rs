@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::anyhow;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 
 pub struct CachePublicKey {
     name: String,
@@ -60,9 +60,21 @@ impl CachePublicKeychain {
         }
     }
 
-    pub fn verify(&self, key_name: &str, data: &[u8], signature: &[u8]) -> anyhow::Result<bool> {
+    pub fn verify(
+        &self,
+        key_name: &str,
+        data: &[u8],
+        signature_base64: &[u8],
+    ) -> anyhow::Result<bool> {
         if let Some(key) = self.keys.get(key_name) {
-            let signature = Signature::from_slice(signature)?;
+            let mut signature_bytes = [0u8; SIGNATURE_LENGTH];
+            let bytes_written = STANDARD.decode_slice(signature_base64, &mut signature_bytes)?;
+
+            if bytes_written < signature_bytes.len() {
+                return Err(anyhow!("The given signature isn't long enough!"));
+            }
+
+            let signature = Signature::from_bytes(&signature_bytes);
             Ok(key.key.verify(data, &signature).is_ok())
         } else {
             Ok(false)

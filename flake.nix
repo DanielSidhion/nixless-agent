@@ -30,6 +30,10 @@
             rustfmt
             just
 
+            dbus.dev
+            systemdLibs.dev
+            pkg-config
+
             # Both of these used with VSCode.
             nixpkgs-fmt
             nil.packages.${system}.default

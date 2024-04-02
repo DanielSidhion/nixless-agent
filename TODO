@@ -1,2 +1,11 @@
-- Query the /nix-cache-info endpoint and verify that the StoreDir is the same as the one in the machine running the agent.
 - Contribute an impl of Error back to narinfo crate.
+- Add a polkit rule to be used with this:
+  polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "nixless-agent") {
+      if (action.lookup("unit") == "<name of transient unit>") {
+        if (action.lookup("verb") == "start") {
+          return polkit.Result.YES;
+        }
+      }
+    }
+  });

@@ -1,8 +1,8 @@
 use std::{collections::HashSet, path::PathBuf};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use futures::StreamExt;
-use narinfo::NarInfo;
+use narinfo::{NarInfo, NixCacheInfo};
 use nix_core::to_nix32;
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,7 @@ use xz_decoder::XZDecoder;
 use crate::{fingerprint::Fingerprint, signing::CachePublicKeychain};
 
 pub struct Downloader {
+    store_path: String,
     temp_download_location: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
@@ -69,6 +70,7 @@ impl StartedDownloader {
 
 impl Downloader {
     pub fn new(
+        store_path: String,
         temp_download_location: PathBuf,
         cache_url: String,
         cache_auth_token: Option<String>,
@@ -76,6 +78,7 @@ impl Downloader {
         keychain: CachePublicKeychain,
     ) -> Self {
         Self {
+            store_path,
             temp_download_location,
             cache_url,
             cache_auth_token,
@@ -87,14 +90,21 @@ impl Downloader {
     pub fn start(self) -> StartedDownloader {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(downloader_task(
-            self.temp_download_location,
-            self.cache_url,
-            self.cache_auth_token,
-            self.existing_store_paths,
-            self.keychain,
-            input_rx,
-        ));
+        let task = tokio::spawn(async {
+            downloader_task(
+                self.store_path,
+                self.temp_download_location,
+                self.cache_url,
+                self.cache_auth_token,
+                self.existing_store_paths,
+                self.keychain,
+                input_rx,
+            )
+            .await
+            .unwrap();
+
+            Ok(())
+        });
 
         StartedDownloader {
             task: Some(task),
@@ -104,6 +114,7 @@ impl Downloader {
 }
 
 async fn downloader_task(
+    store_path: String,
     temp_download_location: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
@@ -122,6 +133,36 @@ async fn downloader_task(
     let client = reqwest::Client::builder()
         .default_headers(default_headers)
         .build()?;
+
+    // Before we start doing any work, we should check if the cache given to us has the same store path as us. If it doesn't, it's unlikely that the packages we retrieve will work on our machine.
+    let resp = client
+        .get(format!("{}/nix-cache-info", cache_url))
+        .header("accept", "text/plain")
+        .send()
+        .await
+        // TODO: also send a signal to the rest of the application?
+        .context("Verifying if the cache has the same store path as us")?;
+
+    if resp.status().is_success() {
+        let resp_text = resp.text().await?;
+        let nix_cache_info = NixCacheInfo::parse(&resp_text)
+            .map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
+
+        if nix_cache_info.store_dir != store_path {
+            return Err(anyhow!(
+                "Cache has a store path different from ours. Got {}, expected {}",
+                nix_cache_info.store_dir,
+                store_path
+            ));
+        } else {
+            println!("Cache store path matches ours! Continuing.");
+        }
+    } else {
+        return Err(anyhow!(
+            "Cache returned a {} when trying to verify its store path!",
+            resp.status().as_str()
+        ));
+    }
 
     loop {
         tokio::select! {
@@ -254,7 +295,7 @@ async fn download_one_nar(
     let nardata_url = format!("{}/{}", cache_url, nar_info.url);
     let mut nar_path = download_dir.join(nar_info.url);
 
-    // In case any of the parent paths don't exist, we create them.
+    // In case any of the parent directories don't exist, we create them.
     std::fs::create_dir_all(nar_path.parent().unwrap())?;
 
     let resp = client
