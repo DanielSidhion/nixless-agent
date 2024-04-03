@@ -4,3 +4,4 @@ list.csv
 .direnv
 result
 curl_data*
+my-nix-store
