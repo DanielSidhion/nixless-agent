@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::File,
+    io::Write,
     os::unix::fs::{chown, OpenOptionsExt},
     path::PathBuf,
     process::exit,
@@ -32,14 +33,42 @@ fn get_user_group_id(user_name: &str) -> std::io::Result<(u32, u32)> {
 fn main() {
     let args: Vec<_> = env::args().collect();
 
-    let [_, track_mode, track_directory_path, agent_user] = &args[..] else {
+    let [_, track_mode] = &args[0..2] else {
         eprintln!(
-            "Received wrong number of arguments, was expecting {}, got {}.",
-            4,
+            "Received wrong number of arguments, was expecting >=4, got {}.",
             args.len()
         );
         exit(1);
     };
+
+    let [track_directory_path, agent_user] = &args[2..4] else {
+        eprintln!(
+            "Received wrong number of arguments, was expecting >=4, got {}.",
+            args.len()
+        );
+        exit(1);
+    };
+
+    let service_result: Option<&String>;
+    let exit_code: Option<&String>;
+    let exit_status: Option<&String>;
+
+    if track_mode == "post-switch" {
+        if args.len() != 7 {
+            eprintln!(
+                "Received wrong number of arguments, was expecting 7, got {}.",
+                args.len()
+            );
+            exit(1);
+        }
+        service_result = Some(&args[4]);
+        exit_code = Some(&args[5]);
+        exit_status = Some(&args[6]);
+    } else {
+        service_result = None;
+        exit_code = None;
+        exit_status = None;
+    }
 
     let track_file_name = match track_mode.as_str() {
         "pre-switch" => "pre_switch",
@@ -61,12 +90,24 @@ fn main() {
         .expect("failed to retrieve id of user associated with given user name");
 
     let file_path = track_directory_path.join(track_file_name);
-    let file = File::options()
+    let mut file = File::options()
         .mode(0o600)
         .write(true)
         .create_new(true)
         .open(&file_path)
         .expect("couldn't create a new tracking file");
+
+    if track_mode == "post-switch" {
+        let contents = format!(
+            "{}\n{}\n{}",
+            service_result.unwrap(),
+            exit_code.unwrap(),
+            exit_status.unwrap()
+        );
+        file.write_all(contents.as_bytes())
+            .expect("failed to write contents to tracking file");
+        _ = file.flush();
+    }
 
     drop(file);
 

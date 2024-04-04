@@ -31,6 +31,9 @@ pub enum DownloaderRequest {
         paths: Vec<String>,
         resp_tx: oneshot::Sender<anyhow::Result<Vec<NarDownloadResult>>>,
     },
+    DownloadSystem {
+        system_id: String,
+    },
 }
 
 pub struct StartedDownloader {
@@ -203,6 +206,9 @@ async fn downloader_task(
                         };
 
                         resp_tx.send(resp).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    Some(DownloaderRequest::DownloadSystem { system_id }) => {
+                        todo!()
                     }
                 }
             }

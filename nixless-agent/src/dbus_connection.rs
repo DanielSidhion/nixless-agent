@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use dbus::{
     arg::{RefArg, Variant},
-    nonblock::{Proxy, SyncConnection},
+    nonblock::{stdintf::org_freedesktop_dbus::Properties, Proxy, SyncConnection},
     Path,
 };
 use tokio::{
@@ -60,11 +60,11 @@ impl StartedDBusConnection {
         resp_rx.await?
     }
 
-    pub async fn start_system_switch(&self) -> anyhow::Result<()> {
+    pub async fn perform_system_switch(&self) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         self.input_tx
-            .send(DBusConnectionRequest::StartSystemSwitch { resp_tx })
+            .send(DBusConnectionRequest::PerformSystemSwitch { resp_tx })
             .await?;
         resp_rx.await?
     }
@@ -74,7 +74,7 @@ pub enum DBusConnectionRequest {
     CheckAuthorisationPossibility {
         resp_tx: oneshot::Sender<anyhow::Result<bool>>,
     },
-    StartSystemSwitch {
+    PerformSystemSwitch {
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -99,8 +99,8 @@ async fn dbus_connection_task(
                         let res = check_polkit_authorised(conn.clone()).await;
                         resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
-                    Some(DBusConnectionRequest::StartSystemSwitch { resp_tx }) => {
-                        let res = start_system_switch(conn.clone()).await;
+                    Some(DBusConnectionRequest::PerformSystemSwitch { resp_tx }) => {
+                        let res = perform_system_switch(conn.clone()).await;
                         resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
                 }
@@ -148,13 +148,13 @@ async fn check_polkit_authorised(conn: Arc<SyncConnection>) -> anyhow::Result<bo
     Ok(is_authorised || is_challenge)
 }
 
-async fn start_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
+async fn perform_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
     // https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html
     let systemd_proxy = Proxy::new(
         "org.freedesktop.systemd1",
         "/org/freedesktop/systemd1",
         Duration::from_millis(1000),
-        conn,
+        conn.clone(),
     );
 
     let aux_not_used: Vec<(String, Vec<(String, Variant<&str>)>)> = Vec::new();
@@ -167,6 +167,12 @@ async fn start_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
     // - a boolean whether it should be considered a failure if the process exits uncleanly.
     // a(sasb)
     let exec_start: Vec<(String, Vec<String>, bool)> = vec![(
+        // "/usr/bin/bash".to_string(),
+        // vec![
+        //     "/usr/bin/bash".to_string(),
+        //     "-c".to_string(),
+        //     "sleep 3".to_string(),
+        // ],
         "/usr/bin/false".to_string(),
         vec!["/usr/bin/false".to_string()],
         false,
@@ -194,14 +200,13 @@ async fn start_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
     transient_service_properties.push(("Type", Variant(Box::new("oneshot".to_string()))));
     transient_service_properties.push(("RefuseManualStop", Variant(Box::new(true))));
     transient_service_properties.push(("RemainAfterExit", Variant(Box::new(false))));
+    // We already have the ExecStartPost/ExecStopPost commands to tell us whether the switch succeeded or failed, so we don't need systemd to keep the unit around if it fails.
+    transient_service_properties.push((
+        "CollectMode",
+        Variant(Box::new("inactive-or-failed".to_string())),
+    ));
 
-    // in  s name,
-    // in  s mode,
-    // in  a(sv) properties,
-    // in  a(sa(sv)) aux,
-    // out o job
-
-    let (service_path,): (Path,) = systemd_proxy
+    let (job_path,): (Path,) = systemd_proxy
         .method_call(
             "org.freedesktop.systemd1.Manager",
             "StartTransientUnit",
@@ -214,7 +219,100 @@ async fn start_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
         )
         .await?;
 
-    println!("Got service path {}", service_path);
+    // Now we'll keep waiting for the switch to finish.
+    // First we make sure the job is done.
+    let job_proxy = Proxy::new(
+        "org.freedesktop.systemd1",
+        job_path,
+        Duration::from_millis(1000),
+        conn.clone(),
+    );
+
+    loop {
+        match job_proxy
+            .get::<String>("org.freedesktop.systemd1.Job", "State")
+            .await
+        {
+            Ok(state) => {
+                if state == "running" {
+                    // Means we can get a unit object already, so we'll stop checking for the job specifically. In theory we could only rely on whether the job exists or not, but we want to check the unit to make sure it will not be kept around once it's done.
+                    break;
+                }
+
+                println!("Job is in state {}, sleeping for 500ms", state);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(err) => {
+                if let Some("org.freedesktop.DBus.Error.UnknownObject") = err.name() {
+                    // Job is finished running, so we'll check for the status of the unit next.
+                    break;
+                }
+
+                return Err(err).context("trying to get status of the job we created");
+            }
+        }
+    }
+
+    let (unit_path,): (Path,) = match systemd_proxy
+        .method_call(
+            "org.freedesktop.systemd1.Manager",
+            "GetUnit",
+            ("nixless-agent-system-switch.service",),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            if let Some("org.freedesktop.systemd1.NoSuchUnit") = err.name() {
+                // Means the service has already stopped, so there's nothing else for us to do here.
+                return Ok(());
+            }
+
+            return Err(err).context("trying to get the path to the unit we started");
+        }
+    };
+
+    println!("Unit path is {}", unit_path.to_string());
+
+    let unit_proxy = Proxy::new(
+        "org.freedesktop.systemd1",
+        unit_path,
+        Duration::from_millis(1000),
+        conn,
+    );
+
+    loop {
+        match unit_proxy
+            .get::<String>("org.freedesktop.systemd1.Unit", "ActiveState")
+            .await
+        {
+            Ok(state) => {
+                if state == "inactive" {
+                    println!("Unit is inactive, nothing else to do!");
+                    break;
+                }
+
+                if state == "activating" || state == "deactivating" {
+                    println!("Unit is in state {}, sleeping for 500ms", state);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                if state == "active" || state == "reloading" || state == "failed" {
+                    println!("Unit is in state {}", state);
+                    return Err(anyhow!("when waiting for the systemd switch unit to finish, it entered a state we were not expecting"));
+                }
+            }
+            Err(err) => {
+                println!(
+                    "We got the following error when checking for the unit: {:?} message {:?}",
+                    err.name(),
+                    err.message()
+                );
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

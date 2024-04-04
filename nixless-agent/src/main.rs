@@ -11,11 +11,14 @@ use downloader::{Downloader, StartedDownloader};
 use signing::CachePublicKeychain;
 use unpacker::{StartedUnpacker, Unpacker};
 
+use crate::state_keeper::StateKeeper;
+
 mod dbus_connection;
 mod downloader;
 mod fingerprint;
 mod process_init;
 mod signing;
+mod state_keeper;
 mod unpacker;
 
 async fn entry_point(
@@ -61,6 +64,10 @@ struct Args {
     /// Cache authorization token. Will be sent in an "Authorization" header on every request.
     #[arg(long)]
     cache_auth_token: Option<String>,
+
+    /// Path where we keep some state about the store and the system.
+    #[arg(short, long, default_value = "/nix/var")]
+    store_state_directory: PathBuf,
 }
 
 async fn probe_nix_store(store_path: &PathBuf) -> anyhow::Result<HashSet<String>> {
@@ -96,8 +103,11 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         ));
     }
 
+    let (store_state, control_channels) =
+        StateKeeper::with_state_directory(args.store_state_directory)?.start();
+
     println!("Trying to start transient service...");
-    dbus_connection.start_system_switch().await?;
+    dbus_connection.perform_system_switch().await?;
 
     let keychain = CachePublicKeychain::with_known_keys()?;
     let existing_store_paths = probe_nix_store(&args.nix_store_path).await?;
@@ -148,6 +158,9 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     process_init::ensure_caps()?;
+
+    // TODO: if we detect the nix daemon running, bail here.
+
     process_init::prepare_nix_store(&args.nix_store_path)?;
     process_init::drop_caps()?;
 

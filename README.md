@@ -16,6 +16,8 @@ Helpful tips when hacking on D-Bus stuff:
 
   Some more docs on transient services are [here](https://systemd.io/CONTROL_GROUP_INTERFACE/#creating-and-starting).
 
+  Sometimes it may be necessary to reset the state of a failed transient service with `systemctl reset-failed <unit-name>` to get it to be removed.
+
 - D-Bus types are documented [here](https://dbus.freedesktop.org/doc/dbus-specification.html#type-system).
 
 Helpful tips when hacking on polkit stuff:

@@ -9,3 +9,4 @@
       }
     }
   });
+- Check if nix daemon is running (maybe through systemd), and bail if it is
