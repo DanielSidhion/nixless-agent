@@ -3,6 +3,6 @@ resolver = "2"
 
 members = [
     "nix-core",
-    "nixless-agent",
+    "nixless-agent", "system-switch-tracker",
     "xz-decoder"
 ]
