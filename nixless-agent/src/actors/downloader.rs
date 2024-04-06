@@ -1,6 +1,10 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Context};
+use derive_builder::Builder;
 use futures::StreamExt;
 use narinfo::{NarInfo, NixCacheInfo};
 use nix_core::to_nix32;
@@ -9,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::JoinHandle,
 };
 use tokio_util::io::{InspectWriter, StreamReader};
@@ -17,23 +21,16 @@ use xz_decoder::XZDecoder;
 
 use crate::{fingerprint::Fingerprint, signing::CachePublicKeychain};
 
+#[derive(Builder)]
 pub struct Downloader {
     store_path: String,
     temp_download_location: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
-    existing_store_paths: HashSet<String>,
-    keychain: CachePublicKeychain,
 }
 
 pub enum DownloaderRequest {
-    DownloadPaths {
-        paths: Vec<String>,
-        resp_tx: oneshot::Sender<anyhow::Result<Vec<NarDownloadResult>>>,
-    },
-    DownloadSystem {
-        system_id: String,
-    },
+    DownloadPaths { paths: Vec<String> },
 }
 
 pub struct StartedDownloader {
@@ -57,37 +54,17 @@ impl StartedDownloader {
         Ok(())
     }
 
-    pub async fn download_paths(
-        &self,
-        paths: Vec<String>,
-    ) -> anyhow::Result<Vec<NarDownloadResult>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-
-        self.input_tx
-            .send(DownloaderRequest::DownloadPaths { paths, resp_tx })
-            .await?;
-
-        resp_rx.await?
+    pub async fn download_paths(&self, paths: Vec<String>) -> anyhow::Result<()> {
+        Ok(self
+            .input_tx
+            .send(DownloaderRequest::DownloadPaths { paths })
+            .await?)
     }
 }
 
 impl Downloader {
-    pub fn new(
-        store_path: String,
-        temp_download_location: PathBuf,
-        cache_url: String,
-        cache_auth_token: Option<String>,
-        existing_store_paths: HashSet<String>,
-        keychain: CachePublicKeychain,
-    ) -> Self {
-        Self {
-            store_path,
-            temp_download_location,
-            cache_url,
-            cache_auth_token,
-            existing_store_paths,
-            keychain,
-        }
+    pub fn builder() -> DownloaderBuilder {
+        DownloaderBuilder::default()
     }
 
     pub fn start(self) -> StartedDownloader {
@@ -99,8 +76,6 @@ impl Downloader {
                 self.temp_download_location,
                 self.cache_url,
                 self.cache_auth_token,
-                self.existing_store_paths,
-                self.keychain,
                 input_rx,
             )
             .await
@@ -121,10 +96,11 @@ async fn downloader_task(
     temp_download_location: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
-    mut existing_store_paths: HashSet<String>,
-    keychain: CachePublicKeychain,
     mut input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
+    let keychain = CachePublicKeychain::with_known_keys()?;
+    let mut existing_store_paths = probe_nix_store(&store_path).await?;
+
     let mut default_headers = HeaderMap::new();
 
     if let Some(token) = cache_auth_token {
@@ -172,7 +148,7 @@ async fn downloader_task(
             req = input_rx.recv() => {
                 match req {
                     None => break,
-                    Some(DownloaderRequest::DownloadPaths { paths, resp_tx }) => {
+                    Some(DownloaderRequest::DownloadPaths { paths }) => {
                         println!("Got a download request!");
 
                         let mut download_futures = Vec::new();
@@ -205,10 +181,7 @@ async fn downloader_task(
                             err => err,
                         };
 
-                        resp_tx.send(resp).map_err(|_| anyhow!("channel closed before we could send the response"))?;
-                    }
-                    Some(DownloaderRequest::DownloadSystem { system_id }) => {
-                        todo!()
+                        // TODO: send signal to the state keeper.
                     }
                 }
             }
@@ -216,6 +189,28 @@ async fn downloader_task(
     }
 
     Ok(())
+}
+
+async fn probe_nix_store(store_path: impl AsRef<Path>) -> anyhow::Result<HashSet<String>> {
+    let mut entries = tokio::fs::read_dir(store_path).await?;
+    let mut path_set = HashSet::new();
+
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            if let Some(path_str) = entry.path().to_str() {
+                path_set.insert(path_str.to_string());
+            } else {
+                return Err(anyhow!("found a path in the store containing non-UTF-8 characters, which is unexpected: {}", entry.path().to_string_lossy()));
+            }
+        } else {
+            return Err(anyhow!(
+                "found a path in the store that isn't a directory, which is unexpected: {}",
+                entry.path().to_string_lossy()
+            ));
+        }
+    }
+
+    Ok(path_set)
 }
 
 pub struct NarDownloadResult {

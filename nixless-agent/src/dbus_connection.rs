@@ -68,6 +68,15 @@ impl StartedDBusConnection {
             .await?;
         resp_rx.await?
     }
+
+    pub async fn wait_system_switch_complete(&self) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.input_tx
+            .send(DBusConnectionRequest::WaitSystemSwitchComplete { resp_tx })
+            .await?;
+        resp_rx.await?
+    }
 }
 
 pub enum DBusConnectionRequest {
@@ -75,6 +84,9 @@ pub enum DBusConnectionRequest {
         resp_tx: oneshot::Sender<anyhow::Result<bool>>,
     },
     PerformSystemSwitch {
+        resp_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    WaitSystemSwitchComplete {
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -101,6 +113,10 @@ async fn dbus_connection_task(
                     }
                     Some(DBusConnectionRequest::PerformSystemSwitch { resp_tx }) => {
                         let res = perform_system_switch(conn.clone()).await;
+                        resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    Some(DBusConnectionRequest::WaitSystemSwitchComplete { resp_tx }) => {
+                        let res = wait_system_switch_complete(conn.clone()).await;
                         resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
                 }
@@ -253,6 +269,18 @@ async fn perform_system_switch(conn: Arc<SyncConnection>) -> anyhow::Result<()> 
             }
         }
     }
+
+    wait_system_switch_complete(conn.clone()).await?;
+    Ok(())
+}
+
+async fn wait_system_switch_complete(conn: Arc<SyncConnection>) -> anyhow::Result<()> {
+    let systemd_proxy = Proxy::new(
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        Duration::from_millis(1000),
+        conn.clone(),
+    );
 
     let (unit_path,): (Path,) = match systemd_proxy
         .method_call(

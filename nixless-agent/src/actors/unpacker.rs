@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::anyhow;
+use derive_builder::Builder;
 use nix::sys::{
     stat::{utimensat, UtimensatFlags},
     time::TimeSpec,
@@ -17,8 +18,9 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::downloader::NarDownloadResult;
+use super::NarDownloadResult;
 
+#[derive(Builder)]
 pub struct Unpacker {
     store_path: PathBuf,
 }
@@ -63,8 +65,8 @@ impl StartedUnpacker {
 }
 
 impl Unpacker {
-    pub fn new(store_path: PathBuf) -> Self {
-        Self { store_path }
+    pub fn builder() -> UnpackerBuilder {
+        UnpackerBuilder::default()
     }
 
     pub fn start(self) -> StartedUnpacker {
