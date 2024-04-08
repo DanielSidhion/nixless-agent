@@ -1,9 +1,14 @@
 use actix_web::{
-    error::InternalError, guard::fn_guard, http::StatusCode, web, App, HttpRequest, HttpResponse,
-    HttpServer, Responder,
+    error::InternalError, http::StatusCode, web, App, HttpRequest, HttpResponse, HttpServer,
+    Responder,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use anyhow::anyhow;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tracing::instrument;
 
 use super::StartedStateKeeper;
 
@@ -27,19 +32,13 @@ impl Server {
             App::new()
                 .app_data(inputs_sender.clone())
                 .route(
-                    "/",
-                    web::post()
-                        .guard(fn_guard(|c| {
-                            c.head().headers().get("content-length").is_some_and(|val| {
-                                val.to_str()
-                                    .is_ok_and(|len| len.parse::<u32>().is_ok_and(|l| l > 0))
-                            })
-                        }))
-                        .to(entry_point),
+                    "/new-configuration",
+                    web::post().to(parse_new_configuration),
                 )
                 .route("/", web::to(HttpResponse::ImATeapot))
         })
         .shutdown_timeout(5)
+        .workers(2)
         .bind(("0.0.0.0", self.port))?
         .run();
 
@@ -60,47 +59,72 @@ pub struct StartedServer {
 }
 
 pub enum ServerRequest {
-    UpdateToNewSystem { system_id: String },
+    UpdateToNewSystem {
+        toplevel_path_string: String,
+        paths: Vec<String>,
+        resp_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
+#[instrument(skip_all)]
 async fn server_task(
     input_rx: mpsc::Receiver<ServerRequest>,
     state_keeper: StartedStateKeeper,
 ) -> anyhow::Result<()> {
     let mut input_stream = ReceiverStream::new(input_rx);
 
+    tracing::info!("Server will now enter its main loop.");
+
     while let Some(req) = input_stream.next().await {
         match req {
-            ServerRequest::UpdateToNewSystem { system_id } => {}
+            ServerRequest::UpdateToNewSystem {
+                toplevel_path_string,
+                paths,
+                resp_tx,
+            } => {
+                let res = state_keeper
+                    .switch_to_new_system(toplevel_path_string, paths)
+                    .await;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+            }
         }
     }
 
     Ok(())
 }
 
-async fn entry_point(
+#[instrument(skip_all, fields(uri = req.uri().to_string(), method = req.method().as_str()))]
+async fn parse_new_configuration(
     req: HttpRequest,
     payload_string: String,
     inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
 ) -> actix_web::Result<impl Responder> {
-    // TODO: properly parse the payload string.
+    let mut lines = payload_string.lines();
 
-    inputs_sender
-        .send(ServerRequest::UpdateToNewSystem {
-            system_id: payload_string,
-        })
-        .await
-        .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+    if let Some(toplevel_path_string) = lines.next() {
+        let paths: Vec<_> = lines.map(str::to_string).collect();
 
-    // let download_results = downloader
-    //     .download_paths(paths)
-    //     .await
-    //     .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+        let (resp_tx, resp_rx) = oneshot::channel();
 
-    // unpacker
-    //     .unpack_downloads(download_results)
-    //     .await
-    //     .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+        inputs_sender
+            .send(ServerRequest::UpdateToNewSystem {
+                toplevel_path_string: toplevel_path_string.to_string(),
+                paths,
+                resp_tx,
+            })
+            .await
+            .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
 
-    Ok(HttpResponse::NoContent())
+        match resp_rx
+            .await
+            .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
+        {
+            Ok(()) => Ok(HttpResponse::NoContent().finish()),
+            Err(err) => Ok(HttpResponse::Conflict().body(err.to_string())),
+        }
+    } else {
+        Ok(HttpResponse::BadRequest().finish())
+    }
 }

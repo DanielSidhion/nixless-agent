@@ -1,5 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    fs::{read_dir, read_link, read_to_string},
+    path::PathBuf,
+};
 
+use anyhow::anyhow;
 use caps::{CapSet, Capability};
 use nix::{
     mount::{mount, MsFlags},
@@ -59,5 +63,50 @@ pub fn drop_caps() -> anyhow::Result<()> {
     caps::drop(None, CapSet::Effective, Capability::CAP_SETPCAP)?;
     caps::drop(None, CapSet::Permitted, Capability::CAP_SYS_ADMIN)?;
     caps::drop(None, CapSet::Permitted, Capability::CAP_SETPCAP)?;
+    Ok(())
+}
+
+/// This can never guarantee the nix daemon isn't running in the system, but for all common cases, it will catch the daemon and error when it does.
+pub fn ensure_nix_daemon_not_present() -> anyhow::Result<()> {
+    let procs = read_dir("/proc")?;
+
+    for entry in procs {
+        let entry = entry?;
+        let entry_file_name = entry.file_name();
+        let file_name = entry_file_name
+            .to_str()
+            .ok_or_else(|| anyhow!("Entry in /proc has a path that can't be converted to UTF-8"))?;
+
+        if file_name.parse::<usize>().is_ok() && entry.file_type()?.is_dir() {
+            // We'll first check the link to the executable, and if that fails we'll check the cmdline.
+            let path = entry.path();
+            let exe_path = path.join("exe");
+
+            match read_link(&exe_path) {
+                Ok(exe_link)
+                    if exe_link
+                        .file_name()
+                        .is_some_and(|n| n == "nix" || n == "nix-daemon") =>
+                {
+                    return Err(anyhow!(
+                        "Detected pid {} running the nix binary, so we can't start",
+                        file_name
+                    ));
+                }
+                Ok(_) => (),
+                Err(_) => {
+                    let cmdline_contents = read_to_string(path.join("cmdline"))?;
+
+                    if cmdline_contents.contains("nix-daemon") {
+                        return Err(anyhow!(
+                            "Detected pid {} running the nix binary, so we can't start",
+                            file_name
+                        ));
+                    }
+                }
+            };
+        }
+    }
+
     Ok(())
 }

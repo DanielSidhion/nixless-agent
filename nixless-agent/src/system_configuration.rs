@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct SystemConfiguration {
     pub version_number: u32,
     pub toplevel_path_string: String,
+    #[builder(default)]
     pub paths: Vec<String>,
 }
 

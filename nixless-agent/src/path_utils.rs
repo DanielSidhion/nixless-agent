@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -7,6 +8,7 @@ use std::{
 use anyhow::anyhow;
 use futures::future::join_all;
 use nix::unistd::{chown, geteuid};
+use tracing::instrument;
 
 pub fn get_number_from_numbered_system_name(name: &OsStr) -> anyhow::Result<u32> {
     Ok(name
@@ -116,4 +118,35 @@ pub async fn remove_file_with_check(path: impl AsRef<Path>) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn collect_nix_store_paths(
+    store_path: impl AsRef<Path>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut entries = tokio::fs::read_dir(store_path).await?;
+    let mut path_set = HashSet::new();
+
+    tracing::info!("Going to read dir entries now");
+
+    while let Some(entry) = entries.next_entry().await? {
+        tracing::info!(
+            file_name = entry.file_name().to_string_lossy().to_string(),
+            "Got an entry"
+        );
+        if entry.file_type().await?.is_dir() {
+            if let Some(path_str) = entry.path().to_str() {
+                path_set.insert(path_str.to_string());
+            } else {
+                return Err(anyhow!("found a path in the store containing non-UTF-8 characters, which is unexpected: {}", entry.path().to_string_lossy()));
+            }
+        } else {
+            return Err(anyhow!(
+                "found a path in the store that isn't a directory, which is unexpected: {}",
+                entry.path().to_string_lossy()
+            ));
+        }
+    }
+
+    Ok(path_set)
 }

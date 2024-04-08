@@ -2,8 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::anyhow;
 use derive_builder::Builder;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tracing::instrument;
 
 use crate::{
     dbus_connection::DBusConnection,
@@ -31,12 +35,20 @@ impl StateKeeper {
     pub fn start(self) -> StartedStateKeeper {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(state_keeper_task(
-            self.directory,
-            self.downloader,
-            input_rx,
-            input_tx.clone(),
-        ));
+        let input_tx_clone = input_tx.clone();
+        let task = tokio::spawn(async {
+            match state_keeper_task(self.directory, self.downloader, input_rx, input_tx_clone).await
+            {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "The state keeper task encountered a fatal error and has stopped."
+                    );
+                    Err(err)
+                }
+            }
+        });
 
         StartedStateKeeper {
             task: Some(task),
@@ -48,7 +60,11 @@ impl StateKeeper {
 enum StateKeeperRequest {
     CleanUpDir,
     CleanUpDirResult(anyhow::Result<()>),
-    UpdateToNewSystem,
+    UpdateToNewSystem {
+        toplevel_path_string: String,
+        paths: Vec<String>,
+        resp_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 pub struct StartedStateKeeper {
@@ -63,18 +79,43 @@ impl StartedStateKeeper {
             input_tx: self.input_tx.clone(),
         }
     }
+
+    pub async fn switch_to_new_system(
+        &self,
+        toplevel_path_string: String,
+        paths: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.input_tx
+            .send(StateKeeperRequest::UpdateToNewSystem {
+                toplevel_path_string,
+                paths,
+                resp_tx,
+            })
+            .await?;
+
+        resp_rx.await?
+    }
 }
 
+#[instrument(skip_all)]
 async fn state_keeper_task(
     directory: PathBuf,
     downloader: StartedDownloader,
     input_rx: mpsc::Receiver<StateKeeperRequest>,
     input_tx: mpsc::Sender<StateKeeperRequest>,
 ) -> anyhow::Result<()> {
+    tracing::info!("Checking if we can possibly be authorised to manage systemd units.");
+
     let dbus_connection = DBusConnection::new().start();
     if !dbus_connection.check_authorisation_possibility().await? {
-        return Err(anyhow!("we can't continue with the state keeper startup"));
+        return Err(anyhow!(
+            "we're not authorised to manage systemd units, so we won't be able to switch systems"
+        ));
     }
+
+    tracing::info!("We might be authorised to manage systemd units, continuing initialisation.");
 
     let mut state = AgentState::from_directory(directory.clone()).await?;
 
@@ -83,7 +124,7 @@ async fn state_keeper_task(
         AgentStateStatus::Temporary => unreachable!("Temporary agent status should be unreachable"),
         AgentStateStatus::New | AgentStateStatus::Standby => {
             // We can start operating normally, but we'll enqueue a job to clean up the directory.
-            state.set_standby().await?;
+            state.set_standby()?;
             input_tx.send(StateKeeperRequest::CleanUpDir).await?;
         }
         AgentStateStatus::FailedSwitch { .. } => {
@@ -134,6 +175,8 @@ async fn state_keeper_task(
         }
     }
 
+    tracing::info!("State keeper finished early status decision-making, will now enter its main processing loop.");
+
     let mut input_stream = ReceiverStream::new(input_rx);
     let mut pending_clean_up_task: Option<JoinHandle<()>> = None;
 
@@ -152,18 +195,41 @@ async fn state_keeper_task(
                 }));
             }
             StateKeeperRequest::CleanUpDirResult(Err(err)) => {
-                println!("We failed to clean up the directory! Error we got: {}", err);
+                tracing::error!(?err, "We failed to clean up the nix state directory!");
                 pending_clean_up_task = None;
             }
             StateKeeperRequest::CleanUpDirResult(Ok(())) => {
                 pending_clean_up_task = None;
             }
-            StateKeeperRequest::UpdateToNewSystem => {}
+            StateKeeperRequest::UpdateToNewSystem {
+                toplevel_path_string,
+                paths,
+                resp_tx,
+            } => {
+                match state.status() {
+                    AgentStateStatus::New | AgentStateStatus::Temporary => unreachable!("should have never been in a new or temporary state during the state keeper main loop"),
+                    AgentStateStatus::FailedSwitch { .. } => {
+                        resp_tx.send(Err(anyhow!("The system already failed a system switch and must be recovered before switching to a new configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    AgentStateStatus::DownloadingNewSystem { .. } => {
+                        resp_tx.send(Err(anyhow!("The system is already downloading a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    AgentStateStatus::SwitchingToNewSystem { .. } => {
+                        resp_tx.send(Err(anyhow!("The system is already switching to a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    AgentStateStatus::Standby => {
+                        // TODO: go through with the request to update.
+                        resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                }
+            }
         }
     }
 
+    tracing::info!("State keeper exited its main loop, will continue shutting down.");
+
     if let Some(task) = pending_clean_up_task {
-        println!("We have a pending clean up task, waiting for it to finish.");
+        tracing::info!("We have a pending clean up task, waiting for it to finish.");
         task.await?;
     }
 

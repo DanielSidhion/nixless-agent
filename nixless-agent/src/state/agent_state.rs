@@ -135,9 +135,9 @@ impl AgentState {
         &self.current_status
     }
 
-    pub async fn set_standby(&mut self) -> anyhow::Result<()> {
+    pub fn set_standby(&mut self) -> anyhow::Result<()> {
         self.current_status = AgentStateStatus::Standby;
-        self.save().await
+        self.save()
     }
 
     fn latest_system_toplevel_path_string(&self) -> &String {
@@ -196,7 +196,7 @@ impl AgentState {
                 std::mem::replace(&mut self.current_status, AgentStateStatus::Standby);
             self.system_configurations
                 .push(previous_status.into_inner_configuration().unwrap());
-            self.save().await?;
+            self.save()?;
             // Will take care of fixing the links to the system profile for us.
             self.repair_profile_links().await?;
 
@@ -213,7 +213,7 @@ impl AgentState {
             self.current_status = AgentStateStatus::FailedSwitch {
                 configuration: previous_status.into_inner_configuration().unwrap(),
             };
-            self.save().await?;
+            self.save()?;
 
             Ok(())
         } else {
@@ -221,9 +221,20 @@ impl AgentState {
         }
     }
 
-    async fn save(&self) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(self)?;
-        Ok(tokio::fs::write(&self.state_file_path, bytes).await?)
+    fn save(&self) -> anyhow::Result<()> {
+        let parent_dir = self.state_file_path.parent().unwrap();
+
+        if !parent_dir.exists() {
+            std::fs::create_dir_all(parent_dir)?;
+        }
+
+        let mut file = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.state_file_path)?;
+        serde_json::to_writer(&mut file, self)?;
+        Ok(())
     }
 
     async fn get_current_system_numbered_path(directory: &PathBuf) -> anyhow::Result<u32> {

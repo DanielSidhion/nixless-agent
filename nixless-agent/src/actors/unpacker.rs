@@ -17,6 +17,8 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tracing::instrument;
 
 use super::NarDownloadResult;
 
@@ -81,32 +83,32 @@ impl Unpacker {
     }
 }
 
+#[instrument(skip_all)]
 async fn unpacker_task(
     store_path: PathBuf,
-    mut input_rx: mpsc::Receiver<UnpackerRequest>,
+    input_rx: mpsc::Receiver<UnpackerRequest>,
 ) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            req = input_rx.recv() => {
-                match req {
-                    None => break,
-                    Some(UnpackerRequest::UnpackDownloads { downloads, resp_tx }) => {
-                        println!("Got downloads to unpack!");
+    let mut input_stream = ReceiverStream::new(input_rx);
 
-                        // TODO: this currently runs on a single thread. Moving it to multiple threads (but still bounded by some limit) is not too trivial and will require a bit of thought.
-                        let store_path_copy = store_path.clone();
-                        let unpack_task = tokio::task::spawn_blocking(move || {
-                            for download in downloads {
-                                unpack_one_nar(&store_path_copy, &download.store_path, &download.nar_path)?;
-                            }
+    tracing::info!("Unpacker will now enter its main loop.");
 
-                            Ok(())
-                        });
-
-                        let res = unpack_task.await?;
-                        resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+    while let Some(req) = input_stream.next().await {
+        match req {
+            UnpackerRequest::UnpackDownloads { downloads, resp_tx } => {
+                // TODO: this currently runs on a single thread. Moving it to multiple threads (but still bounded by some limit) is not too trivial and will require a bit of thought.
+                let store_path_copy = store_path.clone();
+                let unpack_task = tokio::task::spawn_blocking(move || {
+                    for download in downloads {
+                        unpack_one_nar(&store_path_copy, &download.store_path, &download.nar_path)?;
                     }
-                }
+
+                    Ok(())
+                });
+
+                let res = unpack_task.await?;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
             }
         }
     }

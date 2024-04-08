@@ -10,6 +10,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 pub struct DBusConnection;
 
@@ -21,7 +22,18 @@ impl DBusConnection {
     pub fn start(self) -> StartedDBusConnection {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(dbus_connection_task(input_rx));
+        let task = tokio::spawn(async {
+            match dbus_connection_task(input_rx).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "The D-Bus connection task encountered a fatal error and has stopped."
+                    );
+                    Err(err)
+                }
+            }
+        });
 
         StartedDBusConnection {
             input_tx,
@@ -32,7 +44,7 @@ impl DBusConnection {
 
 pub struct StartedDBusConnection {
     task: Option<JoinHandle<anyhow::Result<()>>>,
-    input_tx: mpsc::Sender<DBusConnectionRequest>,
+    pub input_tx: mpsc::Sender<DBusConnectionRequest>,
 }
 
 impl StartedDBusConnection {
@@ -92,7 +104,7 @@ pub enum DBusConnectionRequest {
 }
 
 async fn dbus_connection_task(
-    mut input_rx: mpsc::Receiver<DBusConnectionRequest>,
+    input_rx: mpsc::Receiver<DBusConnectionRequest>,
 ) -> anyhow::Result<()> {
     let (resource, conn) = dbus_tokio::connection::new_system_sync()?;
 
@@ -102,28 +114,36 @@ async fn dbus_connection_task(
         panic!("D-Bus got disconnected with the following error: {}", err);
     });
 
-    loop {
-        tokio::select! {
-            req = input_rx.recv() => {
-                match req {
-                    None => break,
-                    Some(DBusConnectionRequest::CheckAuthorisationPossibility { resp_tx }) => {
-                        let res = check_polkit_authorised(conn.clone()).await;
-                        resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
-                    }
-                    Some(DBusConnectionRequest::PerformSystemSwitch { resp_tx }) => {
-                        let res = perform_system_switch(conn.clone()).await;
-                        resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
-                    }
-                    Some(DBusConnectionRequest::WaitSystemSwitchComplete { resp_tx }) => {
-                        let res = wait_system_switch_complete(conn.clone()).await;
-                        resp_tx.send(res).map_err(|_| anyhow!("channel closed before we could send the response"))?;
-                    }
-                }
+    let mut input_stream = ReceiverStream::new(input_rx);
+
+    tracing::info!(
+        "D-Bus connection has finished initialisation and will now enter its main loop."
+    );
+
+    while let Some(req) = input_stream.next().await {
+        match req {
+            DBusConnectionRequest::CheckAuthorisationPossibility { resp_tx } => {
+                let res = check_polkit_authorised(conn.clone()).await;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+            }
+            DBusConnectionRequest::PerformSystemSwitch { resp_tx } => {
+                let res = perform_system_switch(conn.clone()).await;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+            }
+            DBusConnectionRequest::WaitSystemSwitchComplete { resp_tx } => {
+                let res = wait_system_switch_complete(conn.clone()).await;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
             }
         }
     }
 
+    tracing::info!("D-Bus connection task exited its main loop, will now abort the connection to the system bus.");
     dbus_task.abort();
 
     Ok(())

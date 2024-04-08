@@ -16,10 +16,14 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{InspectWriter, StreamReader};
+use tracing::instrument;
 use xz_decoder::XZDecoder;
 
-use crate::{fingerprint::Fingerprint, signing::CachePublicKeychain};
+use crate::{
+    fingerprint::Fingerprint, path_utils::collect_nix_store_paths, signing::CachePublicKeychain,
+};
 
 #[derive(Builder)]
 pub struct Downloader {
@@ -71,7 +75,7 @@ impl Downloader {
         let (input_tx, input_rx) = mpsc::channel(10);
 
         let task = tokio::spawn(async {
-            downloader_task(
+            match downloader_task(
                 self.store_path,
                 self.temp_download_location,
                 self.cache_url,
@@ -79,9 +83,16 @@ impl Downloader {
                 input_rx,
             )
             .await
-            .unwrap();
-
-            Ok(())
+            {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "The downloader task encountered a fatal error and has stopped."
+                    );
+                    Err(err)
+                }
+            }
         });
 
         StartedDownloader {
@@ -91,15 +102,27 @@ impl Downloader {
     }
 }
 
+#[instrument(skip_all)]
 async fn downloader_task(
     store_path: String,
     temp_download_location: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
-    mut input_rx: mpsc::Receiver<DownloaderRequest>,
+    input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
     let keychain = CachePublicKeychain::with_known_keys()?;
-    let mut existing_store_paths = probe_nix_store(&store_path).await?;
+
+    tracing::info!(
+        store_path,
+        "Reading the nix store to determine all existing packages."
+    );
+
+    let mut existing_store_paths = collect_nix_store_paths(&store_path).await?;
+
+    tracing::info!(
+        store_path,
+        "Finished reading the nix store to determine all existing packages."
+    );
 
     let mut default_headers = HeaderMap::new();
 
@@ -113,6 +136,11 @@ async fn downloader_task(
         .default_headers(default_headers)
         .build()?;
 
+    tracing::debug!(
+        cache_url,
+        "Verifying if the configured binary cache has a matching store path."
+    );
+
     // Before we start doing any work, we should check if the cache given to us has the same store path as us. If it doesn't, it's unlikely that the packages we retrieve will work on our machine.
     let resp = client
         .get(format!("{}/nix-cache-info", cache_url))
@@ -120,7 +148,7 @@ async fn downloader_task(
         .send()
         .await
         // TODO: also send a signal to the rest of the application?
-        .context("Verifying if the cache has the same store path as us")?;
+        .context("failed to verify if the cache has the same store path as us")?;
 
     if resp.status().is_success() {
         let resp_text = resp.text().await?;
@@ -128,13 +156,14 @@ async fn downloader_task(
             .map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
 
         if nix_cache_info.store_dir != store_path {
-            return Err(anyhow!(
-                "Cache has a store path different from ours. Got {}, expected {}",
-                nix_cache_info.store_dir,
-                store_path
-            ));
+            // TODO: re-enable this.
+            // return Err(anyhow!(
+            //     "Cache has a store path different from ours. Got {}, expected {}",
+            //     nix_cache_info.store_dir,
+            //     store_path
+            // ));
         } else {
-            println!("Cache store path matches ours! Continuing.");
+            tracing::debug!("Cache store path matches ours! Continuing.");
         }
     } else {
         return Err(anyhow!(
@@ -143,74 +172,68 @@ async fn downloader_task(
         ));
     }
 
-    loop {
-        tokio::select! {
-            req = input_rx.recv() => {
-                match req {
-                    None => break,
-                    Some(DownloaderRequest::DownloadPaths { paths }) => {
-                        println!("Got a download request!");
+    tracing::info!("Downloader has finished initialisation and will now enter its main loop.");
 
-                        let mut download_futures = Vec::new();
+    let mut input_stream = ReceiverStream::new(input_rx);
 
-                        for path in paths.iter() {
-                            if existing_store_paths.contains(path) {
-                                continue;
-                            }
+    while let Some(req) = input_stream.next().await {
+        match req {
+            DownloaderRequest::DownloadPaths { paths } => {
+                let mut download_futures = Vec::new();
 
-                            download_futures.push(download_one_nar(client.clone(), &temp_download_location, &cache_url, &path, &keychain));
-                        }
-
-                        let download_futures = futures::stream::iter(download_futures);
-                        // We need to collect from the stream into a Vec of Results first, because the stream doesn't allow us to directly convert from a Vec of Results into a Result of Vec.
-                        // TODO: make number of parallel downloads configurable.
-                        let download_results: Result<Vec<_>, _> = download_futures.buffer_unordered(5).collect::<Vec<_>>().await.into_iter().collect();
-
-                        let resp = match download_results {
-                            Ok(download_results) => {
-                                // If we're here, it means no download returned an error, so we'll assume every store path will be populated once the NARs are unpacked. With this assumption, we'll already extend our set of existing store paths. If there's an error eventually when unpacking the NARs, the system will be in an inconsistent state and it's expected that it will take the proper action to bring consistency back.
-                                download_results.iter().for_each(|r| { existing_store_paths.insert(r.store_path.clone()); });
-
-                                // We'll check that all references for the NARs we downloaded exist (or will exist) locally, otherwise we'll have to error to prevent the system from pointing to a path that doesn't exist.
-                                if download_results.iter().any(|r| r.references.iter().any(|rp| !existing_store_paths.contains(rp))) {
-                                    Err(anyhow!("the paths that were downloaded have missing references!"))
-                                } else {
-                                    Ok(download_results)
-                                }
-                            }
-                            err => err,
-                        };
-
-                        // TODO: send signal to the state keeper.
+                for path in paths.iter() {
+                    if existing_store_paths.contains(path) {
+                        continue;
                     }
+
+                    download_futures.push(download_one_nar(
+                        client.clone(),
+                        &temp_download_location,
+                        &cache_url,
+                        &path,
+                        &keychain,
+                    ));
                 }
+
+                let download_futures = futures::stream::iter(download_futures);
+                // We need to collect from the stream into a Vec of Results first, because the stream doesn't allow us to directly convert from a Vec of Results into a Result of Vec.
+                // TODO: make number of parallel downloads configurable.
+                let download_results: Result<Vec<_>, _> = download_futures
+                    .buffer_unordered(5)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect();
+
+                let resp = match download_results {
+                    Ok(download_results) => {
+                        // If we're here, it means no download returned an error, so we'll assume every store path will be populated once the NARs are unpacked. With this assumption, we'll already extend our set of existing store paths. If there's an error eventually when unpacking the NARs, the system will be in an inconsistent state and it's expected that it will take the proper action to bring consistency back.
+                        download_results.iter().for_each(|r| {
+                            existing_store_paths.insert(r.store_path.clone());
+                        });
+
+                        // We'll check that all references for the NARs we downloaded exist (or will exist) locally, otherwise we'll have to error to prevent the system from pointing to a path that doesn't exist.
+                        if download_results.iter().any(|r| {
+                            r.references
+                                .iter()
+                                .any(|rp| !existing_store_paths.contains(rp))
+                        }) {
+                            Err(anyhow!(
+                                "the paths that were downloaded have missing references!"
+                            ))
+                        } else {
+                            Ok(download_results)
+                        }
+                    }
+                    err => err,
+                };
+
+                // TODO: send signal to the state keeper.
             }
         }
     }
 
     Ok(())
-}
-
-async fn probe_nix_store(store_path: impl AsRef<Path>) -> anyhow::Result<HashSet<String>> {
-    let mut entries = tokio::fs::read_dir(store_path).await?;
-    let mut path_set = HashSet::new();
-
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            if let Some(path_str) = entry.path().to_str() {
-                path_set.insert(path_str.to_string());
-            } else {
-                return Err(anyhow!("found a path in the store containing non-UTF-8 characters, which is unexpected: {}", entry.path().to_string_lossy()));
-            }
-        } else {
-            return Err(anyhow!(
-                "found a path in the store that isn't a directory, which is unexpected: {}",
-                entry.path().to_string_lossy()
-            ));
-        }
-    }
-
-    Ok(path_set)
 }
 
 pub struct NarDownloadResult {
