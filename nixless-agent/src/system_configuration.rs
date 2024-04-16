@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Builder, Clone, Deserialize, Serialize)]
 pub struct SystemConfiguration {
     pub version_number: u32,
-    pub toplevel_path_string: String,
+    pub system_package_id: String,
     #[builder(default)]
-    pub paths: Vec<String>,
+    pub package_ids: Vec<String>,
 }
 
 impl SystemConfiguration {

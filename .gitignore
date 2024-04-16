@@ -5,3 +5,4 @@ list.csv
 result
 curl_data*
 my-nix-store
+.nixos-test-history

@@ -24,7 +24,7 @@ use super::NarDownloadResult;
 
 #[derive(Builder)]
 pub struct Unpacker {
-    store_path: PathBuf,
+    nix_store_dir: PathBuf,
 }
 
 pub enum UnpackerRequest {
@@ -74,7 +74,7 @@ impl Unpacker {
     pub fn start(self) -> StartedUnpacker {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(unpacker_task(self.store_path, input_rx));
+        let task = tokio::spawn(unpacker_task(self.nix_store_dir, input_rx));
 
         StartedUnpacker {
             task: Some(task),
@@ -85,7 +85,7 @@ impl Unpacker {
 
 #[instrument(skip_all)]
 async fn unpacker_task(
-    store_path: PathBuf,
+    nix_store_dir: PathBuf,
     input_rx: mpsc::Receiver<UnpackerRequest>,
 ) -> anyhow::Result<()> {
     let mut input_stream = ReceiverStream::new(input_rx);
@@ -96,10 +96,16 @@ async fn unpacker_task(
         match req {
             UnpackerRequest::UnpackDownloads { downloads, resp_tx } => {
                 // TODO: this currently runs on a single thread. Moving it to multiple threads (but still bounded by some limit) is not too trivial and will require a bit of thought.
-                let store_path_copy = store_path.clone();
+                let nix_store_dir_clone = nix_store_dir.clone();
                 let unpack_task = tokio::task::spawn_blocking(move || {
-                    for download in downloads {
-                        unpack_one_nar(&store_path_copy, &download.store_path, &download.nar_path)?;
+                    let downloads_to_unpack =
+                        downloads.into_iter().filter(|d| !d.is_already_unpacked);
+                    for download in downloads_to_unpack {
+                        unpack_one_nar(
+                            &nix_store_dir_clone,
+                            &download.package_id,
+                            &download.nar_path,
+                        )?;
                     }
 
                     Ok(())
@@ -117,22 +123,24 @@ async fn unpacker_task(
 }
 
 fn unpack_one_nar(
-    nix_store_path: &PathBuf,
-    store_path: &str,
+    nix_store_dir: &PathBuf,
+    package_id: &str,
     nar_path: &PathBuf,
 ) -> anyhow::Result<()> {
+    // TODO: double check that the NAR exists and the store path to unpack to doesn't exist.
+
     let tmp_dir_name: String = repeat_with(fastrand::alphanumeric).take(12).collect();
-    let tmp_dir = nix_store_path.join(tmp_dir_name);
+    let tmp_dir = nix_store_dir.join(tmp_dir_name);
 
     let file = File::options().read(true).open(nar_path)?;
     let nar_decoder = Decoder::new(file)?;
     nar_decoder.unpack(&tmp_dir)?;
     drop(nar_decoder);
 
-    let final_path = nix_store_path.join(store_path);
+    let final_path = nix_store_dir.join(package_id);
 
     std::fs::rename(&tmp_dir, &final_path)?;
-    finalise_store_path(&final_path)?;
+    finalise_nix_store_object(&final_path)?;
 
     // Since the NAR unpacking is done, we'll delete it.
     std::fs::remove_file(nar_path)?;
@@ -140,17 +148,18 @@ fn unpack_one_nar(
     Ok(())
 }
 
-/// Nix store objects shouldn't be writable, their timestamps should be set to the epoch, certain attributes removed and so on. This function handles all of that.
+/// Objects in the Nix store shouldn't be writable, their timestamps should be set to the epoch, certain attributes removed and so on. This function handles all of that.
+/// Note that here we use "object" to mean not only a package in the Nix store, but also each file/directory/symlink inside the package. We call each one of those an "object".
 // TODO: check if more stuff needs to be done from https://github.com/NixOS/nix/blob/9b88e5284608116b7db0dbd3d5dd7a33b90d52d7/src/libstore/posix-fs-canonicalise.cc#L58
-fn finalise_store_path(path: &PathBuf) -> anyhow::Result<()> {
-    let stat = std::fs::symlink_metadata(path)?;
+fn finalise_nix_store_object(object_path: &PathBuf) -> anyhow::Result<()> {
+    let stat = std::fs::symlink_metadata(object_path)?;
 
     if !stat.is_symlink() {
         let mut perms = stat.permissions();
         if !perms.readonly() {
             // Fix permissions. Can't have writable stuff in the store.
             perms.set_readonly(true);
-            std::fs::set_permissions(path, perms)?;
+            std::fs::set_permissions(object_path, perms)?;
         }
     }
 
@@ -163,7 +172,7 @@ fn finalise_store_path(path: &PathBuf) -> anyhow::Result<()> {
         // Fix modified time, which should be 1 second after the epoch.
         utimensat(
             None,
-            path,
+            object_path,
             &TimeSpec::UTIME_OMIT,
             &TimeSpec::new(1, 0),
             UtimensatFlags::NoFollowSymlink,
@@ -172,11 +181,11 @@ fn finalise_store_path(path: &PathBuf) -> anyhow::Result<()> {
 
     if stat.is_dir() {
         // Before changing the owner, we'll recurse in the directory fixing all other permissions first, and change the owner from the bottom-up to prevent getting locked out from making any other changes.
-        for entry in read_dir(path)? {
-            finalise_store_path(&entry?.path())?;
+        for entry in read_dir(object_path)? {
+            finalise_nix_store_object(&entry?.path())?;
         }
     }
 
-    lchown(path, Some(0), Some(0))?;
+    lchown(object_path, Some(0), Some(0))?;
     Ok(())
 }

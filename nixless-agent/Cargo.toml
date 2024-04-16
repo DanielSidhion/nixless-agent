@@ -8,10 +8,11 @@ actix-web = { version = "4", features = [ "rustls" ] }
 anyhow = "1"
 base64 = "0.22"
 caps = "0.5"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dbus = { version = "0.9", features = ["futures"] }
 dbus-tokio = "0.7"
 derive_builder = "0.20"
+dotenvy = "0.15"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 fastrand = "2"
 futures = "0.3"

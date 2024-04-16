@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::anyhow;
 use derive_builder::Builder;
 use tokio::{
@@ -10,8 +8,8 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::instrument;
 
 use crate::{
-    dbus_connection::DBusConnection,
-    path_utils::clean_up_nix_dir,
+    dbus_connection::StartedDBusConnection,
+    path_utils::clean_up_nix_var_dir,
     state::{
         check_switching_status, clean_up_system_switch_tracking_files, AgentState, AgentStateStatus,
     },
@@ -22,7 +20,8 @@ use super::{StartedDownloader, StartedUnpacker};
 #[derive(Builder)]
 #[builder(pattern = "owned")]
 pub struct StateKeeper {
-    directory: PathBuf,
+    state: AgentState,
+    dbus_connection: StartedDBusConnection,
     downloader: StartedDownloader,
     unpacker: StartedUnpacker,
 }
@@ -37,7 +36,15 @@ impl StateKeeper {
 
         let input_tx_clone = input_tx.clone();
         let task = tokio::spawn(async {
-            match state_keeper_task(self.directory, self.downloader, input_rx, input_tx_clone).await
+            match state_keeper_task(
+                self.state,
+                self.dbus_connection,
+                self.downloader,
+                self.unpacker,
+                input_rx,
+                input_tx_clone,
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -58,13 +65,14 @@ impl StateKeeper {
 }
 
 enum StateKeeperRequest {
-    CleanUpDir,
-    CleanUpDirResult(anyhow::Result<()>),
-    UpdateToNewSystem {
-        toplevel_path_string: String,
-        paths: Vec<String>,
+    CleanUpStateDir,
+    CleanUpStateDirResult(anyhow::Result<()>),
+    SwitchToNewConfiguration {
+        system_package_id: String,
+        package_ids: Vec<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    ConfigurationSwitchResult(anyhow::Result<()>),
 }
 
 pub struct StartedStateKeeper {
@@ -80,17 +88,17 @@ impl StartedStateKeeper {
         }
     }
 
-    pub async fn switch_to_new_system(
+    pub async fn switch_to_new_configuration(
         &self,
-        toplevel_path_string: String,
-        paths: Vec<String>,
+        system_package_id: String,
+        package_ids: Vec<String>,
     ) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         self.input_tx
-            .send(StateKeeperRequest::UpdateToNewSystem {
-                toplevel_path_string,
-                paths,
+            .send(StateKeeperRequest::SwitchToNewConfiguration {
+                system_package_id,
+                package_ids,
                 resp_tx,
             })
             .await?;
@@ -101,14 +109,15 @@ impl StartedStateKeeper {
 
 #[instrument(skip_all)]
 async fn state_keeper_task(
-    directory: PathBuf,
+    mut state: AgentState,
+    dbus_connection: StartedDBusConnection,
     downloader: StartedDownloader,
+    unpacker: StartedUnpacker,
     input_rx: mpsc::Receiver<StateKeeperRequest>,
     input_tx: mpsc::Sender<StateKeeperRequest>,
 ) -> anyhow::Result<()> {
     tracing::info!("Checking if we can possibly be authorised to manage systemd units.");
 
-    let dbus_connection = DBusConnection::new().start();
     if !dbus_connection.check_authorisation_possibility().await? {
         return Err(anyhow!(
             "we're not authorised to manage systemd units, so we won't be able to switch systems"
@@ -117,29 +126,30 @@ async fn state_keeper_task(
 
     tracing::info!("We might be authorised to manage systemd units, continuing initialisation.");
 
-    let mut state = AgentState::from_directory(directory.clone()).await?;
+    let mut input_stream = ReceiverStream::new(input_rx);
+    let state_base_dir = state.base_dir();
 
     // If we're here, we just got started, so we'll check what was our previous status and figure out next steps from there.
     match state.status() {
         AgentStateStatus::Temporary => unreachable!("Temporary agent status should be unreachable"),
         AgentStateStatus::New | AgentStateStatus::Standby => {
-            // We can start operating normally, but we'll enqueue a job to clean up the directory.
+            // We can start operating normally, but we'll enqueue a job to clean up the state directory.
             state.set_standby()?;
-            input_tx.send(StateKeeperRequest::CleanUpDir).await?;
+            input_tx.send(StateKeeperRequest::CleanUpStateDir).await?;
         }
         AgentStateStatus::FailedSwitch { .. } => {
             // We'll start in a "read-only" mode.
         }
-        AgentStateStatus::DownloadingNewSystem { configuration } => {
+        AgentStateStatus::DownloadingNewConfiguration { configuration } => {
             // We'll continue downloading the new system, but aside from that will operate normally.
             downloader
-                .download_paths(configuration.paths.clone())
+                .download_packages(configuration.package_ids.clone())
                 .await?;
         }
-        AgentStateStatus::SwitchingToNewSystem { .. } => {
+        AgentStateStatus::SwitchingToConfiguration { .. } => {
             // We must check whether we switched successfully or not. In case the system switch task isn't yet complete, we'll loop again once it is complete so we can evaluate what to do.
             loop {
-                let switching_status = check_switching_status(&directory).await?;
+                let switching_status = check_switching_status(&state_base_dir).await?;
                 match (
                     switching_status.started,
                     switching_status.finished,
@@ -147,7 +157,7 @@ async fn state_keeper_task(
                 ) {
                     (true, true, true) => {
                         // TODO: check if we have to reboot due to a kernel or some other thing that changed that requires a reboot. If we do, only consider things successful after the reboot.
-                        clean_up_system_switch_tracking_files(&directory).await?;
+                        clean_up_system_switch_tracking_files(&state_base_dir).await?;
                         state.mark_new_system_successful().await?;
                         break;
                     }
@@ -166,7 +176,7 @@ async fn state_keeper_task(
                         }
                     }
                     (_, false, _) | (false, _, _) => {
-                        dbus_connection.wait_system_switch_complete().await?;
+                        dbus_connection.wait_configuration_switch_complete().await?;
                         // After the wait, we'll continue through the loop so we can evaluate the results once again.
                         // TODO: detect when we're stuck in an infinite loop and bail.
                     }
@@ -177,33 +187,35 @@ async fn state_keeper_task(
 
     tracing::info!("State keeper finished early status decision-making, will now enter its main processing loop.");
 
-    let mut input_stream = ReceiverStream::new(input_rx);
     let mut pending_clean_up_task: Option<JoinHandle<()>> = None;
+    let mut pending_system_switch_task: Option<JoinHandle<()>> = None;
 
     while let Some(req) = input_stream.next().await {
         match req {
-            StateKeeperRequest::CleanUpDir => {
+            StateKeeperRequest::CleanUpStateDir => {
                 let input_tx_clone = input_tx.clone();
-                let dir = directory.clone();
+                let dir = state.base_dir_nix();
+                tracing::info!("Starting a task to clean up the Nix state dir.");
                 pending_clean_up_task = Some(tokio::spawn(async move {
-                    let res = clean_up_nix_dir(dir).await;
+                    let res = clean_up_nix_var_dir(dir).await;
                     // TODO: deal with error when sending the result back.
                     input_tx_clone
-                        .send(StateKeeperRequest::CleanUpDirResult(res))
+                        .send(StateKeeperRequest::CleanUpStateDirResult(res))
                         .await
                         .unwrap();
                 }));
             }
-            StateKeeperRequest::CleanUpDirResult(Err(err)) => {
-                tracing::error!(?err, "We failed to clean up the nix state directory!");
+            StateKeeperRequest::CleanUpStateDirResult(Err(err)) => {
+                tracing::error!(?err, "We failed to clean up the state directory!");
                 pending_clean_up_task = None;
             }
-            StateKeeperRequest::CleanUpDirResult(Ok(())) => {
+            StateKeeperRequest::CleanUpStateDirResult(Ok(())) => {
+                tracing::info!("Task to clean up the Nix state dir succeeded!");
                 pending_clean_up_task = None;
             }
-            StateKeeperRequest::UpdateToNewSystem {
-                toplevel_path_string,
-                paths,
+            StateKeeperRequest::SwitchToNewConfiguration {
+                system_package_id,
+                package_ids,
                 resp_tx,
             } => {
                 match state.status() {
@@ -211,17 +223,62 @@ async fn state_keeper_task(
                     AgentStateStatus::FailedSwitch { .. } => {
                         resp_tx.send(Err(anyhow!("The system already failed a system switch and must be recovered before switching to a new configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
-                    AgentStateStatus::DownloadingNewSystem { .. } => {
+                    AgentStateStatus::DownloadingNewConfiguration { .. } => {
                         resp_tx.send(Err(anyhow!("The system is already downloading a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
-                    AgentStateStatus::SwitchingToNewSystem { .. } => {
+                    AgentStateStatus::SwitchingToConfiguration { .. } => {
                         resp_tx.send(Err(anyhow!("The system is already switching to a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
                     AgentStateStatus::Standby => {
-                        // TODO: go through with the request to update.
+                        state.mark_switching_new_system(system_package_id, package_ids.clone())?;
+
+                        let input_tx_clone = input_tx.clone();
+                        let downloader_child = downloader.child();
+                        let unpacker_child = unpacker.child();
+                        let dbus_connection_child = dbus_connection.child();
+                        let new_configuration_path = state.new_configuration_system_package_path().unwrap(); // We just marked that we're switching to a new system, so the `unwrap()` should never fail.
+                        // We send the response just before starting the task just to try to avoid as much as possible any issues with never sending a response back if the system switch is almost immediate (e.g. everything already downloaded).
+                        // TODO: guarantee that we'll wait until a response is sent back all the way through the server before we proceed with system switch?
                         resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                        pending_system_switch_task = Some(tokio::spawn(async move {
+                            let res = match downloader_child.download_packages(package_ids).await {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    return;
+                                },
+                            };
+
+                            match unpacker_child.unpack_downloads(res).await {
+                                Ok(()) => (),
+                                Err(err) => {
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    return;
+                                }
+                            };
+
+                            match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
+                                Ok(()) => (),
+                                Err(err) => {
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    return;
+                                }
+                            }
+
+                            // TODO: check if system switch was made successfully, similar code from the start up of the state keeper.
+                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Ok(()))).await.unwrap();
+                        }));
                     }
                 }
+            }
+            StateKeeperRequest::ConfigurationSwitchResult(Err(err)) => {
+                tracing::error!(?err, "We failed to perform a system switch!");
+                pending_system_switch_task = None;
+            }
+            StateKeeperRequest::ConfigurationSwitchResult(Ok(())) => {
+                tracing::info!("System switch completed successfully!");
+                state.mark_new_system_successful().await?;
+                pending_system_switch_task = None;
             }
         }
     }
@@ -230,6 +287,11 @@ async fn state_keeper_task(
 
     if let Some(task) = pending_clean_up_task {
         tracing::info!("We have a pending clean up task, waiting for it to finish.");
+        task.await?;
+    }
+
+    if let Some(task) = pending_system_switch_task {
+        tracing::info!("We have a pending system switch task, waiting for it to finish.");
         task.await?;
     }
 

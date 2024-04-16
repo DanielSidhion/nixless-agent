@@ -9,6 +9,7 @@ use nix::{
     mount::{mount, MsFlags},
     sched::{unshare, CloneFlags},
     sys::statvfs::{statvfs, FsFlags},
+    unistd::{chown, getgid},
 };
 
 pub fn ensure_caps() -> anyhow::Result<()> {
@@ -107,6 +108,34 @@ pub fn ensure_nix_daemon_not_present() -> anyhow::Result<()> {
             };
         }
     }
+
+    Ok(())
+}
+
+pub fn load_extra_env_file() -> anyhow::Result<()> {
+    let env_file_path = match ::std::env::var("NIXLESS_AGENT_EXTRA_ENV_FILE") {
+        Ok(val) => PathBuf::from(val),
+        Err(_) => {
+            let systemd_state_directory =
+                ::std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| String::new());
+
+            let mut dot_env_path = PathBuf::from(&systemd_state_directory);
+            dot_env_path.push(".env");
+            dot_env_path
+        }
+    };
+
+    tracing::info!(?env_file_path, "Loading additional environment variables.");
+
+    dotenvy::from_path(env_file_path).or_else(|e| match e {
+        dotenvy::Error::Io(io_error)
+            if matches!(io_error.kind(), ::std::io::ErrorKind::NotFound) =>
+        {
+            // If we don't find any .env files to load, just keep going instead of erroring out.
+            Ok(())
+        }
+        other => Err(other),
+    })?;
 
     Ok(())
 }

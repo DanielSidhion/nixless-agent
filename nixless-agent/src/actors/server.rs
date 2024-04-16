@@ -33,7 +33,7 @@ impl Server {
                 .app_data(inputs_sender.clone())
                 .route(
                     "/new-configuration",
-                    web::post().to(parse_new_configuration),
+                    web::post().to(handle_new_configuration),
                 )
                 .route("/", web::to(HttpResponse::ImATeapot))
         })
@@ -59,9 +59,9 @@ pub struct StartedServer {
 }
 
 pub enum ServerRequest {
-    UpdateToNewSystem {
-        toplevel_path_string: String,
-        paths: Vec<String>,
+    UpdateSystem {
+        system_package_id: String,
+        package_ids: Vec<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -77,13 +77,13 @@ async fn server_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
-            ServerRequest::UpdateToNewSystem {
-                toplevel_path_string,
-                paths,
+            ServerRequest::UpdateSystem {
+                system_package_id,
+                package_ids,
                 resp_tx,
             } => {
                 let res = state_keeper
-                    .switch_to_new_system(toplevel_path_string, paths)
+                    .switch_to_new_configuration(system_package_id, package_ids)
                     .await;
                 resp_tx
                     .send(res)
@@ -96,22 +96,24 @@ async fn server_task(
 }
 
 #[instrument(skip_all, fields(uri = req.uri().to_string(), method = req.method().as_str()))]
-async fn parse_new_configuration(
+async fn handle_new_configuration(
     req: HttpRequest,
     payload_string: String,
     inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
 ) -> actix_web::Result<impl Responder> {
     let mut lines = payload_string.lines();
 
-    if let Some(toplevel_path_string) = lines.next() {
-        let paths: Vec<_> = lines.map(str::to_string).collect();
+    if let Some(system_package_id) = lines.next() {
+        tracing::info!(system_package_id, "Got a new system configuration!");
+
+        let package_ids: Vec<_> = lines.map(str::to_string).collect();
 
         let (resp_tx, resp_rx) = oneshot::channel();
 
         inputs_sender
-            .send(ServerRequest::UpdateToNewSystem {
-                toplevel_path_string: toplevel_path_string.to_string(),
-                paths,
+            .send(ServerRequest::UpdateSystem {
+                system_package_id: system_package_id.to_string(),
+                package_ids,
                 resp_tx,
             })
             .await

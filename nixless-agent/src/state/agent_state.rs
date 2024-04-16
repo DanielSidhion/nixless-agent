@@ -15,10 +15,10 @@ pub enum AgentStateStatus {
     FailedSwitch {
         configuration: SystemConfiguration,
     },
-    DownloadingNewSystem {
+    DownloadingNewConfiguration {
         configuration: SystemConfiguration,
     },
-    SwitchingToNewSystem {
+    SwitchingToConfiguration {
         configuration: SystemConfiguration,
     },
     /// Only used as a temporary variant to avoid copying/cloning the SystemConfiguration of other variants. The agent state should never be left at this value.
@@ -30,8 +30,20 @@ impl AgentStateStatus {
         match self {
             Self::New | Self::Standby => None,
             Self::FailedSwitch { configuration }
-            | Self::DownloadingNewSystem { configuration }
-            | Self::SwitchingToNewSystem { configuration } => Some(configuration),
+            | Self::DownloadingNewConfiguration { configuration }
+            | Self::SwitchingToConfiguration { configuration } => Some(configuration),
+            Self::Temporary => unreachable!("Temporary agent status shouldn't be reachable"),
+        }
+    }
+
+    pub fn inner_configuration_system_package_id(&self) -> Option<String> {
+        match self {
+            Self::New | Self::Standby => None,
+            Self::FailedSwitch { configuration }
+            | Self::DownloadingNewConfiguration { configuration }
+            | Self::SwitchingToConfiguration { configuration } => {
+                Some(configuration.system_package_id.clone())
+            }
             Self::Temporary => unreachable!("Temporary agent status shouldn't be reachable"),
         }
     }
@@ -40,7 +52,11 @@ impl AgentStateStatus {
 #[derive(Deserialize, Serialize)]
 pub struct AgentState {
     #[serde(skip)]
-    directory: PathBuf,
+    nix_store_dir: String,
+    #[serde(skip)]
+    nix_state_base_dir: PathBuf,
+    #[serde(skip)]
+    nixless_state_dir: PathBuf,
     #[serde(skip)]
     state_file_path: PathBuf,
 
@@ -50,7 +66,7 @@ pub struct AgentState {
 
 impl AgentState {
     fn relative_state_path() -> &'static str {
-        "nixless-agent/state"
+        "state"
     }
 
     fn current_system_path() -> &'static str {
@@ -61,40 +77,68 @@ impl AgentState {
         "nix/profiles/system"
     }
 
-    fn absolute_system_profile_path(&self) -> PathBuf {
-        self.directory.join(Self::relative_system_profile_path())
+    pub fn absolute_state_path(&self) -> PathBuf {
+        self.nixless_state_dir.join(Self::relative_state_path())
     }
 
-    fn absolute_profiles_directory_path(&self) -> PathBuf {
-        self.directory.join("nix/profiles")
+    /// This ends with `_associated` just because we have a method with the same name, so the `_associated` disambiguates to show that this is an associated function rather than a method.
+    fn absolute_state_path_associated(nixless_state_dir: &PathBuf) -> PathBuf {
+        nixless_state_dir.join(Self::relative_state_path())
+    }
+
+    fn absolute_system_profile_path(&self) -> PathBuf {
+        self.nix_state_base_dir
+            .join(Self::relative_system_profile_path())
+    }
+
+    fn absolute_profiles_dir(&self) -> PathBuf {
+        self.nix_state_base_dir.join("nix/profiles")
     }
 
     fn absolute_numbered_system_profile_path(&self, num: u32) -> PathBuf {
-        self.directory
+        self.nix_state_base_dir
             .join(format!("nix/profiles/system-{}-link", num))
     }
 
-    pub async fn from_directory(directory: PathBuf) -> anyhow::Result<Self> {
-        let state_file_path = directory.join(Self::relative_state_path());
+    pub async fn from_saved_state_or_new(
+        nix_store_dir: String,
+        nix_state_base_dir: PathBuf,
+        nixless_state_dir: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let state_file_path = Self::absolute_state_path_associated(&nixless_state_dir);
 
         if !state_file_path.exists() {
-            Self::new(directory, state_file_path).await
+            Self::new(
+                nix_store_dir,
+                nix_state_base_dir,
+                nixless_state_dir,
+                state_file_path,
+            )
+            .await
         } else {
             let mut state: Self =
                 serde_json::from_str(&tokio::fs::read_to_string(&state_file_path).await?)?;
 
-            state.directory = directory;
+            state.nix_store_dir = nix_store_dir;
+            state.nix_state_base_dir = nix_state_base_dir;
+            state.nixless_state_dir = nixless_state_dir;
             state.state_file_path = state_file_path;
             Ok(state)
         }
     }
 
-    async fn new(directory: PathBuf, state_file_path: PathBuf) -> anyhow::Result<Self> {
-        // Will be used if we can't determine the top level of the current system.
+    /// Tries to determine the current configuration by inspecting the current system path, which is usually at `/run/current-system`.
+    async fn new(
+        nix_store_dir: String,
+        nix_state_base_dir: PathBuf,
+        nixless_state_dir: PathBuf,
+        state_file_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        // Will be used if we can't determine the configuration of the current system.
         let build_tombstone_value = || -> anyhow::Result<SystemConfiguration> {
             Ok(SystemConfiguration::builder()
                 .version_number(0)
-                .toplevel_path_string("unknown".to_string())
+                .system_package_id("unknown".to_string())
                 .build()?)
         };
 
@@ -106,16 +150,25 @@ impl AgentState {
             {
                 build_tombstone_value()?
             }
-            Ok(current_version_path) => {
+            Ok(current_system_package_path) => {
                 // We don't want to throw an error if we can't convert it to a utf-8 string, we'll just use the tombstone value instead.
-                if let Some(path_string) = current_version_path.to_str() {
-                    let current_version_number = Self::get_current_system_numbered_path(&directory)
-                        .await
-                        .unwrap_or(0);
+                if let Some(current_system_package_path) = current_system_package_path.to_str() {
+                    // We have the package id, but also must figure out the number it corresponds to. Since we can't do this from the current system path, we'll try to get it by inspecting the current system profile.
+                    let current_version_number = Self::get_current_numbered_system_number(
+                        &nix_state_base_dir,
+                        current_system_package_path,
+                    )
+                    .await
+                    .unwrap_or(0);
 
                     SystemConfiguration::builder()
                         .version_number(current_version_number)
-                        .toplevel_path_string(path_string.to_string())
+                        .system_package_id(
+                            current_system_package_path
+                                .trim_start_matches(&nix_store_dir)
+                                .trim_start_matches("/")
+                                .to_string(),
+                        )
                         .build()?
                 } else {
                     build_tombstone_value()?
@@ -124,11 +177,21 @@ impl AgentState {
         };
 
         Ok(Self {
-            directory,
+            nix_store_dir,
+            nix_state_base_dir,
+            nixless_state_dir,
             state_file_path,
             system_configurations: vec![current_configuration],
             current_status: AgentStateStatus::New,
         })
+    }
+
+    pub fn base_dir(&self) -> PathBuf {
+        self.nixless_state_dir.clone()
+    }
+
+    pub fn base_dir_nix(&self) -> PathBuf {
+        self.nix_state_base_dir.clone()
     }
 
     pub fn status(&self) -> &AgentStateStatus {
@@ -140,32 +203,54 @@ impl AgentState {
         self.save()
     }
 
-    fn latest_system_toplevel_path_string(&self) -> &String {
-        &self
-            .system_configurations
+    pub fn new_configuration_system_package_path(&self) -> Option<String> {
+        self.current_status.inner_configuration_system_package_id()
+    }
+
+    fn latest_configuration_version(&self) -> u32 {
+        self.system_configurations
             .last()
+            .map(|c| c.version_number)
             .unwrap()
-            .toplevel_path_string
+    }
+
+    fn latest_system_package_path(&self) -> PathBuf {
+        let mut p = PathBuf::from_str(&self.nix_store_dir).unwrap();
+        p.push(&self.system_configurations.last().unwrap().system_package_id);
+        p
+    }
+
+    async fn ensure_profiles_directory_exists(&self) -> anyhow::Result<()> {
+        let profiles_dir_path = self.absolute_profiles_dir();
+
+        if !profiles_dir_path.exists() {
+            tokio::fs::create_dir_all(&profiles_dir_path).await?;
+        }
+
+        Ok(())
     }
 
     async fn repair_profile_links(&mut self) -> anyhow::Result<()> {
+        self.ensure_profiles_directory_exists().await?;
+
         // We'll first clean up any numbered system links that we're not tracking.
-        let mut dir_entries = tokio::fs::read_dir(self.absolute_profiles_directory_path()).await?;
+        let mut dir_entries = tokio::fs::read_dir(self.absolute_profiles_dir()).await?;
 
         while let Some(entry) = dir_entries.next_entry().await? {
-            let entry_number = get_number_from_numbered_system_name(&entry.file_name())?;
-
-            if entry.file_name() == "system"
-                || self
-                    .system_configurations
-                    .iter()
-                    .any(|v| v.version_number == entry_number)
-            {
+            if entry.file_name() == "system" {
                 continue;
             }
 
-            // The current entry is not for the system link, or a numbered version that we know of, so we'll remove it.
-            tokio::fs::remove_file(entry.path()).await?;
+            let entry_number = get_number_from_numbered_system_name(&entry.file_name())?;
+
+            if self
+                .system_configurations
+                .iter()
+                .all(|v| v.version_number != entry_number)
+            {
+                // The current entry is not for the current system, or a numbered version that we know of, so we'll remove it.
+                tokio::fs::remove_file(entry.path()).await?;
+            }
         }
 
         // And then recreate any missing numbered system links that we're tracking. In case this code is called just after a successful system switch, this part ensures that we'll create a `system-<num>-link` link for the new configuration.
@@ -173,8 +258,14 @@ impl AgentState {
             let expected_profile_path =
                 self.absolute_numbered_system_profile_path(config.version_number);
 
+            let full_system_package_path = {
+                let mut p = PathBuf::from_str(&self.nix_store_dir)?;
+                p.push(&config.system_package_id);
+                p
+            };
+
             overwrite_symlink_atomically_with_check(
-                PathBuf::from_str(&config.toplevel_path_string)?,
+                full_system_package_path,
                 &expected_profile_path,
             )
             .await?;
@@ -182,7 +273,7 @@ impl AgentState {
 
         // Lastly, we ensure that the `system` symlink points to the latest `system-<num>-link` we're tracking.
         overwrite_symlink_atomically_with_check(
-            PathBuf::from(self.latest_system_toplevel_path_string()),
+            self.latest_system_package_path(),
             &self.absolute_system_profile_path(),
         )
         .await?;
@@ -191,7 +282,7 @@ impl AgentState {
     }
 
     pub async fn mark_new_system_successful(&mut self) -> anyhow::Result<()> {
-        if let AgentStateStatus::SwitchingToNewSystem { .. } = &self.current_status {
+        if let AgentStateStatus::SwitchingToConfiguration { .. } = &self.current_status {
             let previous_status =
                 std::mem::replace(&mut self.current_status, AgentStateStatus::Standby);
             self.system_configurations
@@ -207,7 +298,7 @@ impl AgentState {
     }
 
     pub async fn mark_new_system_failed(&mut self) -> anyhow::Result<()> {
-        if let AgentStateStatus::SwitchingToNewSystem { .. } = &self.current_status {
+        if let AgentStateStatus::SwitchingToConfiguration { .. } = &self.current_status {
             let previous_status =
                 std::mem::replace(&mut self.current_status, AgentStateStatus::Temporary);
             self.current_status = AgentStateStatus::FailedSwitch {
@@ -221,13 +312,33 @@ impl AgentState {
         }
     }
 
-    fn save(&self) -> anyhow::Result<()> {
-        let parent_dir = self.state_file_path.parent().unwrap();
-
-        if !parent_dir.exists() {
-            std::fs::create_dir_all(parent_dir)?;
+    pub fn mark_switching_new_system(
+        &mut self,
+        system_package_id: String,
+        package_ids: Vec<String>,
+    ) -> anyhow::Result<()> {
+        if !matches!(self.current_status, AgentStateStatus::Standby) {
+            return Err(anyhow!(
+                "current state is not standby, we can't switch to a new system"
+            ));
         }
 
+        let next_version_number = self.latest_configuration_version() + 1;
+
+        let new_configuration = SystemConfiguration::builder()
+            .version_number(next_version_number)
+            .system_package_id(system_package_id)
+            .package_ids(package_ids)
+            .build()?;
+
+        self.current_status = AgentStateStatus::SwitchingToConfiguration {
+            configuration: new_configuration,
+        };
+
+        Ok(())
+    }
+
+    fn save(&self) -> anyhow::Result<()> {
         let mut file = std::fs::File::options()
             .create(true)
             .write(true)
@@ -237,16 +348,31 @@ impl AgentState {
         Ok(())
     }
 
-    async fn get_current_system_numbered_path(directory: &PathBuf) -> anyhow::Result<u32> {
-        let current_system_numbered_path =
-            tokio::fs::read_link(directory.join(Self::relative_system_profile_path())).await?;
+    async fn get_current_numbered_system_number(
+        nix_state_base_dir: &PathBuf,
+        current_system_package_path: &str,
+    ) -> anyhow::Result<u32> {
+        // Will get us only the `system-<num>-link` part. We assume that's the format, and then process it to get the `<num>` part only.
+        let current_numbered_system_path =
+            tokio::fs::read_link(nix_state_base_dir.join(Self::relative_system_profile_path()))
+                .await?;
         let current_version_number: u32 = get_number_from_numbered_system_name(
-            current_system_numbered_path
-                // Will get us only the `system-<num>-link` part. We assume that's the format, and then process it to get the `<num>` only.
-                .file_name()
-                .unwrap(),
+            current_numbered_system_path.file_name().unwrap(),
         )?;
 
-        Ok(current_version_number)
+        // As a sanity check, we'll make sure this numbered path points to the same system as the one we were given.
+        let current_actual_system_path =
+            tokio::fs::read_link(&current_numbered_system_path).await?;
+
+        if current_actual_system_path.to_str().ok_or_else(|| {
+            anyhow!("the current numbered system points to a path that can't be converted to utf-8")
+        })? != current_system_package_path
+        {
+            Err(anyhow!(
+                "the current numbered system points to a different system than we were given"
+            ))
+        } else {
+            Ok(current_version_number)
+        }
     }
 }

@@ -25,3 +25,17 @@ Helpful tips when hacking on polkit stuff:
 - You can log stuff from polkit's JavaScript API.
   Check if your polkit daemon was started with the `--no-debug` flag, because if it was, you won't be able to see the logs.
   Remove that flag and restart the daemon.
+
+# Terminology
+
+Nix store dir: usually the `/nix/store` dir.
+
+Nix var dir: usually the `/nix/var` dir.
+
+State base dir: the base directory where the nixless agent will keep its state. Currently this is the same as the Nix var dir.
+
+Package: unit of reference in the Nix store dir. Corresponds to the output of a derivation. The Nix manual refers to this as a "store object", but this project chooses to use the "store object" term to mean any piece inside the Nix store dir (this could mean some file inside a package in the Nix store dir as well).
+
+Package id: the hash + name of the package, e.g. `032wiarm65zp3bh9ak3dz2sqcr3n8g70-bash-interactive-5.2p26`.
+
+Package path: the full path to the package in the filesystem. Is the result of joining the Nix store dir and the package id.

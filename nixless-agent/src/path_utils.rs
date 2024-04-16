@@ -81,7 +81,7 @@ pub async fn chown_and_remove(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn clean_up_nix_dir(dir: PathBuf) -> anyhow::Result<()> {
+pub async fn clean_up_nix_var_dir(base_dir: PathBuf) -> anyhow::Result<()> {
     let relative_paths_to_remove = &[
         "log",
         "nix/daemon-socket",
@@ -96,7 +96,7 @@ pub async fn clean_up_nix_dir(dir: PathBuf) -> anyhow::Result<()> {
     ];
     let mut paths_to_remove: Vec<_> = relative_paths_to_remove
         .iter()
-        .map(|&rp| dir.join(rp))
+        .map(|&rp| base_dir.join(rp))
         .collect();
 
     let removal_futures: Vec<_> = paths_to_remove
@@ -121,32 +121,28 @@ pub async fn remove_file_with_check(path: impl AsRef<Path>) -> anyhow::Result<()
 }
 
 #[instrument(skip_all)]
-pub async fn collect_nix_store_paths(
-    store_path: impl AsRef<Path>,
+pub async fn collect_nix_store_packages(
+    store_dir: impl AsRef<Path>,
 ) -> anyhow::Result<HashSet<String>> {
-    let mut entries = tokio::fs::read_dir(store_path).await?;
-    let mut path_set = HashSet::new();
+    let store_dir_str = store_dir.as_ref().to_str().ok_or_else(|| {
+        anyhow!("the store directory path couldn't be transformed to a utf-8 string")
+    })?;
 
-    tracing::info!("Going to read dir entries now");
+    let mut entries = tokio::fs::read_dir(&store_dir).await?;
+    let mut package_id_set = HashSet::new();
 
     while let Some(entry) = entries.next_entry().await? {
-        tracing::info!(
-            file_name = entry.file_name().to_string_lossy().to_string(),
-            "Got an entry"
-        );
-        if entry.file_type().await?.is_dir() {
-            if let Some(path_str) = entry.path().to_str() {
-                path_set.insert(path_str.to_string());
-            } else {
-                return Err(anyhow!("found a path in the store containing non-UTF-8 characters, which is unexpected: {}", entry.path().to_string_lossy()));
-            }
+        if let Some(path_str) = entry.path().to_str() {
+            package_id_set.insert(
+                path_str
+                    .trim_start_matches(store_dir_str)
+                    .trim_start_matches("/")
+                    .to_string(),
+            );
         } else {
-            return Err(anyhow!(
-                "found a path in the store that isn't a directory, which is unexpected: {}",
-                entry.path().to_string_lossy()
-            ));
+            return Err(anyhow!("found a package in the store with a path containing non-UTF-8 characters, which is unexpected: {}", entry.path().to_string_lossy()));
         }
     }
 
-    Ok(path_set)
+    Ok(package_id_set)
 }

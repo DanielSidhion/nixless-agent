@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context};
 use derive_builder::Builder;
@@ -13,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,19 +19,26 @@ use tracing::instrument;
 use xz_decoder::XZDecoder;
 
 use crate::{
-    fingerprint::Fingerprint, path_utils::collect_nix_store_paths, signing::CachePublicKeychain,
+    fingerprint::Fingerprint,
+    owned_nar_info::OwnedNarInfo,
+    path_utils::collect_nix_store_packages,
+    signing::{CachePublicKey, CachePublicKeychain},
 };
 
 #[derive(Builder)]
 pub struct Downloader {
-    store_path: String,
-    temp_download_location: PathBuf,
+    nix_store_dir: String,
+    temp_download_path: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
+    cache_public_key: Option<String>,
 }
 
 pub enum DownloaderRequest {
-    DownloadPaths { paths: Vec<String> },
+    DownloadPackages {
+        package_ids: Vec<String>,
+        resp_tx: oneshot::Sender<anyhow::Result<Vec<NarDownloadResult>>>,
+    },
 }
 
 pub struct StartedDownloader {
@@ -58,11 +62,20 @@ impl StartedDownloader {
         Ok(())
     }
 
-    pub async fn download_paths(&self, paths: Vec<String>) -> anyhow::Result<()> {
-        Ok(self
-            .input_tx
-            .send(DownloaderRequest::DownloadPaths { paths })
-            .await?)
+    pub async fn download_packages(
+        &self,
+        package_ids: Vec<String>,
+    ) -> anyhow::Result<Vec<NarDownloadResult>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.input_tx
+            .send(DownloaderRequest::DownloadPackages {
+                package_ids,
+                resp_tx,
+            })
+            .await?;
+
+        resp_rx.await?
     }
 }
 
@@ -76,10 +89,11 @@ impl Downloader {
 
         let task = tokio::spawn(async {
             match downloader_task(
-                self.store_path,
-                self.temp_download_location,
+                self.nix_store_dir,
+                self.temp_download_path,
                 self.cache_url,
                 self.cache_auth_token,
+                self.cache_public_key,
                 input_rx,
             )
             .await
@@ -104,23 +118,33 @@ impl Downloader {
 
 #[instrument(skip_all)]
 async fn downloader_task(
-    store_path: String,
-    temp_download_location: PathBuf,
+    nix_store_dir: String,
+    temp_download_path: PathBuf,
     cache_url: String,
     cache_auth_token: Option<String>,
+    cache_public_key: Option<String>,
     input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
-    let keychain = CachePublicKeychain::with_known_keys()?;
+    let mut keychain = CachePublicKeychain::with_known_keys()?;
+
+    if let Some(cache_public_key) = cache_public_key {
+        tracing::info!(
+            cache_public_key,
+            "Adding the configured public key of the binary cache as a trusted key."
+        );
+
+        keychain.add_key(CachePublicKey::from_nix_format(&cache_public_key)?)?;
+    }
 
     tracing::info!(
-        store_path,
+        nix_store_dir,
         "Reading the nix store to determine all existing packages."
     );
 
-    let mut existing_store_paths = collect_nix_store_paths(&store_path).await?;
+    let mut existing_store_package_ids = collect_nix_store_packages(&nix_store_dir).await?;
 
     tracing::info!(
-        store_path,
+        nix_store_dir,
         "Finished reading the nix store to determine all existing packages."
     );
 
@@ -155,7 +179,7 @@ async fn downloader_task(
         let nix_cache_info = NixCacheInfo::parse(&resp_text)
             .map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
 
-        if nix_cache_info.store_dir != store_path {
+        if nix_cache_info.store_dir != nix_store_dir {
             // TODO: re-enable this.
             // return Err(anyhow!(
             //     "Cache has a store path different from ours. Got {}, expected {}",
@@ -178,45 +202,77 @@ async fn downloader_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
-            DownloaderRequest::DownloadPaths { paths } => {
+            DownloaderRequest::DownloadPackages {
+                package_ids,
+                resp_tx,
+            } => {
                 let mut download_futures = Vec::new();
+                let mut existing_package_ids = Vec::new();
 
-                for path in paths.iter() {
-                    if existing_store_paths.contains(path) {
+                for package_id in package_ids {
+                    if existing_store_package_ids.contains(&package_id) {
+                        existing_package_ids.push(package_id);
                         continue;
                     }
 
                     download_futures.push(download_one_nar(
                         client.clone(),
-                        &temp_download_location,
+                        &temp_download_path,
                         &cache_url,
-                        &path,
+                        package_id,
                         &keychain,
                     ));
                 }
 
+                tracing::info!(
+                    locally_owned = existing_package_ids.len(),
+                    to_download = download_futures.len(),
+                    "Started task to download any missing packages."
+                );
+
                 let download_futures = futures::stream::iter(download_futures);
                 // We need to collect from the stream into a Vec of Results first, because the stream doesn't allow us to directly convert from a Vec of Results into a Result of Vec.
                 // TODO: make number of parallel downloads configurable.
-                let download_results: Result<Vec<_>, _> = download_futures
+                let mut download_results: Result<Vec<_>, _> = download_futures
                     .buffer_unordered(5)
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
                     .collect();
 
+                tracing::info!("Finished downloading all missing packages.");
+
+                // We'll augment the download results with the store packages we already had. This is not that efficient because we have to re-fetch the NAR info for the packages we already have.
+                // TODO: make this code more efficient by saving the references for the NARs we download locally so we can load them here instead of fetching from the binary cache again. The references can be cleaned up once the system download operation completes and we verify all references are downloaded.
+                if let Ok(ref mut curr_download_results) = download_results {
+                    tracing::info!(
+                        "Augmenting download results with all packages we already had locally."
+                    );
+
+                    for existing_package_id in existing_package_ids {
+                        let nar_info =
+                            download_nar_info(&client, &cache_url, &existing_package_id).await?;
+                        curr_download_results.push(NarDownloadResult {
+                            package_id: existing_package_id,
+                            nar_path: temp_download_path.join(nar_info.url),
+                            reference_ids: nar_info.references,
+                            is_already_unpacked: true,
+                        });
+                    }
+                }
+
                 let resp = match download_results {
                     Ok(download_results) => {
                         // If we're here, it means no download returned an error, so we'll assume every store path will be populated once the NARs are unpacked. With this assumption, we'll already extend our set of existing store paths. If there's an error eventually when unpacking the NARs, the system will be in an inconsistent state and it's expected that it will take the proper action to bring consistency back.
                         download_results.iter().for_each(|r| {
-                            existing_store_paths.insert(r.store_path.clone());
+                            existing_store_package_ids.insert(r.package_id.clone());
                         });
 
                         // We'll check that all references for the NARs we downloaded exist (or will exist) locally, otherwise we'll have to error to prevent the system from pointing to a path that doesn't exist.
                         if download_results.iter().any(|r| {
-                            r.references
+                            r.reference_ids
                                 .iter()
-                                .any(|rp| !existing_store_paths.contains(rp))
+                                .any(|rp| !existing_store_package_ids.contains(rp))
                         }) {
                             Err(anyhow!(
                                 "the paths that were downloaded have missing references!"
@@ -228,7 +284,9 @@ async fn downloader_task(
                     err => err,
                 };
 
-                // TODO: send signal to the state keeper.
+                resp_tx.send(resp).map_err(|_| {
+                    anyhow!("the channel got closed before we could send a message to it!")
+                })?;
             }
         }
     }
@@ -237,57 +295,20 @@ async fn downloader_task(
 }
 
 pub struct NarDownloadResult {
-    pub store_path: String,
+    pub package_id: String,
     pub nar_path: PathBuf,
-    pub references: Vec<String>,
+    pub reference_ids: Vec<String>,
+    pub is_already_unpacked: bool,
 }
 
 async fn download_one_nar(
     client: reqwest::Client,
     download_dir: &PathBuf,
     cache_url: &str,
-    store_path: &str,
+    package_id: String,
     keychain: &CachePublicKeychain,
 ) -> anyhow::Result<NarDownloadResult> {
-    let narinfo_url: String;
-
-    if let Some((hash, _name)) = store_path.split_once("-") {
-        narinfo_url = format!("{}/{}.narinfo", cache_url, hash);
-    } else {
-        return Err(anyhow!(
-            "Received an unexpected store path to download: {}",
-            store_path
-        ));
-    }
-
-    // Protocol as seen in https://github.com/fzakaria/nix-http-binary-cache-api-spec
-    let resp = client
-        .get(narinfo_url)
-        .header("accept", "text/x-nix-narinfo")
-        .send()
-        .await?;
-
-    let nar_info_text: String;
-
-    if resp.status().is_success() {
-        nar_info_text = resp.text().await?;
-    } else {
-        return Err(anyhow!(
-            "Got a bad response from the cache server! {}",
-            resp.status().as_str()
-        ));
-    }
-
-    let nar_info =
-        NarInfo::parse(&nar_info_text).map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
-
-    if !nar_info.store_path.ends_with(store_path) {
-        return Err(anyhow!(
-            "The info from the cache points to a different store object. Expected {}, got {}",
-            store_path,
-            nar_info.store_path
-        ));
-    }
+    let nar_info = download_nar_info(&client, cache_url, &package_id).await?;
 
     let nar_hash_parts: Vec<_> = nar_info.nar_hash.split(":").collect();
     let ["sha256", nar_hash] = nar_hash_parts[..] else {
@@ -297,7 +318,7 @@ async fn download_one_nar(
         ));
     };
 
-    let file_hash = if let Some(file_hash_inner) = nar_info.file_hash {
+    let file_hash = if let Some(file_hash_inner) = nar_info.file_hash.as_ref() {
         let file_hash_parts: Vec<_> = file_hash_inner.split(":").collect();
         let ["sha256", hash] = file_hash_parts[..] else {
             return Err(anyhow!("The file hash doesn't follow the format we expected. Got {}, expected sha256:<hash>",
@@ -317,10 +338,10 @@ async fn download_one_nar(
     // TODO: as an optimisation, if the NAR file already exists in the download location, check if its hash matches what we got. If it does, we can skip downloading entirely.
 
     let nardata_url = format!("{}/{}", cache_url, nar_info.url);
-    let mut nar_path = download_dir.join(nar_info.url);
+    let mut local_nar_path = download_dir.join(nar_info.url);
 
     // In case any of the parent directories don't exist, we create them.
-    std::fs::create_dir_all(nar_path.parent().unwrap())?;
+    std::fs::create_dir_all(local_nar_path.parent().unwrap())?;
 
     let resp = client
         .get(nardata_url)
@@ -332,9 +353,9 @@ async fn download_one_nar(
         let mut stream_reader = StreamReader::new(resp.bytes_stream().map(|result| {
             result.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
         }));
-        if let Some(ext) = nar_path.extension() {
+        if let Some(ext) = local_nar_path.extension() {
             if ext == "xz" {
-                nar_path = nar_path.with_extension("");
+                local_nar_path = local_nar_path.with_extension("");
             }
         }
         // We'll craft the following pipeline: (response body) -> (compressed hasher) -> (xz decoder) -> (decompressed hasher) -> (file writer) -> (file).
@@ -342,7 +363,7 @@ async fn download_one_nar(
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&nar_path)
+            .open(&local_nar_path)
             .await?;
 
         let file_writer = BufWriter::new(file);
@@ -384,9 +405,9 @@ async fn download_one_nar(
         }
 
         Ok(NarDownloadResult {
-            store_path: store_path.to_string(),
-            nar_path,
-            references: nar_info
+            package_id,
+            nar_path: local_nar_path,
+            reference_ids: nar_info
                 .references
                 .into_iter()
                 .filter_map(|r| {
@@ -398,12 +419,61 @@ async fn download_one_nar(
                     }
                 })
                 .collect(),
+            is_already_unpacked: false,
         })
     } else {
         Err(anyhow!(
             "trying to fetch {} returned a {} status code",
-            nar_path.to_string_lossy(),
+            local_nar_path.to_string_lossy(),
             resp.status().as_str()
         ))
     }
+}
+
+async fn download_nar_info(
+    client: &reqwest::Client,
+    cache_url: &str,
+    package_id: &str,
+) -> anyhow::Result<OwnedNarInfo> {
+    let narinfo_url: String;
+
+    if let Some((hash, _name)) = package_id.split_once("-") {
+        narinfo_url = format!("{}/{}.narinfo", cache_url, hash);
+    } else {
+        return Err(anyhow!(
+            "Received an unexpected package id to download: {}",
+            package_id
+        ));
+    }
+
+    // Protocol as seen in https://github.com/fzakaria/nix-http-binary-cache-api-spec
+    let resp = client
+        .get(narinfo_url)
+        .header("accept", "text/x-nix-narinfo")
+        .send()
+        .await?;
+
+    let nar_info_text: String;
+
+    if resp.status().is_success() {
+        nar_info_text = resp.text().await?;
+    } else {
+        return Err(anyhow!(
+            "Got a bad response from the cache server! {}",
+            resp.status().as_str()
+        ));
+    }
+
+    let nar_info =
+        NarInfo::parse(&nar_info_text).map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
+
+    if !nar_info.store_path.ends_with(&package_id) {
+        return Err(anyhow!(
+            "The info from the cache points to a different package. Expected it to end with {}, got {}",
+            package_id,
+            nar_info.store_path
+        ));
+    }
+
+    Ok(nar_info.into())
 }
