@@ -203,8 +203,15 @@ impl AgentState {
         self.save()
     }
 
-    pub fn new_configuration_system_package_path(&self) -> Option<String> {
-        self.current_status.inner_configuration_system_package_id()
+    pub fn new_configuration_system_package_path(&self) -> Option<PathBuf> {
+        if let Some(system_package_id) = self.current_status.inner_configuration_system_package_id()
+        {
+            let mut res = PathBuf::from(&self.nix_store_dir);
+            res.push(system_package_id);
+            Some(res)
+        } else {
+            None
+        }
     }
 
     fn latest_configuration_version(&self) -> u32 {

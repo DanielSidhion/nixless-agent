@@ -206,7 +206,7 @@ async fn state_keeper_task(
                 }));
             }
             StateKeeperRequest::CleanUpStateDirResult(Err(err)) => {
-                tracing::error!(?err, "We failed to clean up the state directory!");
+                tracing::warn!(?err, "We failed to clean up the state directory!");
                 pending_clean_up_task = None;
             }
             StateKeeperRequest::CleanUpStateDirResult(Ok(())) => {
@@ -244,6 +244,7 @@ async fn state_keeper_task(
                             let res = match downloader_child.download_packages(package_ids).await {
                                 Ok(v) => v,
                                 Err(err) => {
+                                    tracing::error!(?err, "Got an error when downloading packages during system switch.");
                                     input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
                                     return;
                                 },
@@ -252,6 +253,7 @@ async fn state_keeper_task(
                             match unpacker_child.unpack_downloads(res).await {
                                 Ok(()) => (),
                                 Err(err) => {
+                                    tracing::error!(?err, "Got an error when unpacking downloads during system switch.");
                                     input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
                                     return;
                                 }
@@ -260,6 +262,7 @@ async fn state_keeper_task(
                             match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
                                 Ok(()) => (),
                                 Err(err) => {
+                                    tracing::error!(?err, "Got an error when performing a system switch after unpacking all downloads.");
                                     input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
                                     return;
                                 }

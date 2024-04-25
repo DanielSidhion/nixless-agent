@@ -6,7 +6,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use derive_builder::Builder;
 use nix::sys::{
     stat::{utimensat, UtimensatFlags},
@@ -134,7 +134,9 @@ fn unpack_one_nar(
 
     let file = File::options().read(true).open(nar_path)?;
     let nar_decoder = Decoder::new(file)?;
-    nar_decoder.unpack(&tmp_dir)?;
+    nar_decoder
+        .unpack(&tmp_dir)
+        .context("Failed to unpack a NAR with the decoder")?;
     drop(nar_decoder);
 
     let final_path = nix_store_dir.join(package_id);

@@ -124,7 +124,7 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
     let dbus_connection = DBusConnection::builder()
         .relative_configuration_activation_command(args.relative_configuration_activation_command)
         .absolute_activation_tracker_command(args.absolute_activation_tracker_command)
-        .activation_track_dir(state.absolute_state_path())
+        .activation_track_dir(state.absolute_state_path().parent().unwrap().to_path_buf())
         .build()?
         .start();
 
@@ -167,6 +167,7 @@ fn main() -> anyhow::Result<()> {
     process_init::ensure_caps()?;
     ensure_nix_daemon_not_present()?;
     process_init::prepare_nix_store(&args.nix_store_dir)?;
+    process_init::prepare_nix_state(&args.nix_state_dir)?;
     process_init::drop_caps()?;
 
     async_main(args)

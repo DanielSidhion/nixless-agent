@@ -1,6 +1,6 @@
 use std::{
     fs::{read_dir, read_link, read_to_string},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::anyhow;
@@ -9,8 +9,10 @@ use nix::{
     mount::{mount, MsFlags},
     sched::{unshare, CloneFlags},
     sys::statvfs::{statvfs, FsFlags},
-    unistd::{chown, getgid},
+    unistd::{chown, getegid, Gid},
 };
+
+use crate::path_utils::set_group_write_perm;
 
 pub fn ensure_caps() -> anyhow::Result<()> {
     let mut effective_set = caps::read(None, CapSet::Effective)?;
@@ -26,6 +28,10 @@ pub fn ensure_caps() -> anyhow::Result<()> {
     }
     if !effective_set.contains(&Capability::CAP_CHOWN) {
         effective_set.insert(Capability::CAP_CHOWN);
+        should_raise = true;
+    }
+    if !effective_set.contains(&Capability::CAP_FOWNER) {
+        effective_set.insert(Capability::CAP_FOWNER);
         should_raise = true;
     }
 
@@ -52,6 +58,38 @@ pub fn prepare_nix_store(store_path: &PathBuf) -> anyhow::Result<()> {
         )?;
     }
 
+    let current_gid = getegid();
+    // Allows us to unpack NARs into the store.
+    chown(store_path, None, Some(current_gid))?;
+
+    Ok(())
+}
+
+pub fn prepare_nix_state(state_path: &PathBuf) -> anyhow::Result<()> {
+    let current_gid = getegid();
+
+    // We'll start with the parent of the nix state (which should be `/nix`) so we can have permissions to make the `/nix/var` dir and its descendants writable - we'll add and remove stuff in there.
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| anyhow!("the nix state path doesn't have a parent"))?;
+    chown(parent, None, Some(current_gid.clone()))?;
+    set_group_write_perm(parent)?;
+
+    prepare_nix_state_dir(state_path, &current_gid)?;
+    Ok(())
+}
+
+fn prepare_nix_state_dir(curr_dir_path: &Path, gid: &Gid) -> anyhow::Result<()> {
+    chown(curr_dir_path, None, Some(*gid))?;
+    set_group_write_perm(curr_dir_path)?;
+
+    for entry in read_dir(curr_dir_path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            prepare_nix_state_dir(&entry.path(), gid)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -62,8 +100,10 @@ pub fn drop_caps() -> anyhow::Result<()> {
     caps::clear(None, CapSet::Inheritable)?;
     caps::drop(None, CapSet::Effective, Capability::CAP_SYS_ADMIN)?;
     caps::drop(None, CapSet::Effective, Capability::CAP_SETPCAP)?;
+    caps::drop(None, CapSet::Effective, Capability::CAP_FOWNER)?;
     caps::drop(None, CapSet::Permitted, Capability::CAP_SYS_ADMIN)?;
     caps::drop(None, CapSet::Permitted, Capability::CAP_SETPCAP)?;
+    caps::drop(None, CapSet::Permitted, Capability::CAP_FOWNER)?;
     Ok(())
 }
 

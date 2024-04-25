@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::CString,
     fs::File,
     io::Write,
     os::unix::fs::{chown, OpenOptionsExt},
@@ -8,26 +9,19 @@ use std::{
     str::FromStr,
 };
 
-fn get_user_group_id(user_name: &str) -> std::io::Result<(u32, u32)> {
-    let passwd = std::fs::read_to_string("/etc/passwd")?;
-    let user_entry = passwd.lines().find(|line| line.starts_with(user_name));
+use libc::getpwnam;
 
-    if let Some(user_entry) = user_entry {
-        let [_, _, uid, gid, _] = user_entry.splitn(5, ":").collect::<Vec<_>>()[..] else {
-            return Err(std::io::Error::other(
-                "passwd line didn't follow expected format",
-            ));
-        };
-        let uid = uid
-            .parse()
-            .expect("passwd line didn't follow expected format");
-        let gid = gid
-            .parse()
-            .expect("passwd line didn't follow expected format");
-        Ok((uid, gid))
-    } else {
-        Err(std::io::Error::other("user not found"))
+fn get_user_group_id(user_name: &str) -> std::io::Result<(u32, u32)> {
+    let cname = CString::new(user_name)
+        .map_err(|_| std::io::Error::other("unable to convert user name to a cstring"))?;
+    let pwd = unsafe { getpwnam(cname.as_ptr()) };
+    if pwd.is_null() {
+        return Err(std::io::Error::other("user not found"));
     }
+
+    let pwd = unsafe { *pwd };
+
+    Ok((pwd.pw_uid, pwd.pw_gid))
 }
 
 fn main() {
@@ -49,26 +43,10 @@ fn main() {
         exit(1);
     };
 
-    let service_result: Option<&String>;
-    let exit_code: Option<&String>;
-    let exit_status: Option<&String>;
-
-    if track_mode == "post-switch" {
-        if args.len() != 7 {
-            eprintln!(
-                "Received wrong number of arguments, was expecting 7, got {}.",
-                args.len()
-            );
-            exit(1);
-        }
-        service_result = Some(&args[4]);
-        exit_code = Some(&args[5]);
-        exit_status = Some(&args[6]);
-    } else {
-        service_result = None;
-        exit_code = None;
-        exit_status = None;
-    }
+    // These come from systemd, but are only set in certain cases (e.g. during ExecStopPost).
+    let service_result: Option<String> = env::var("SERVICE_RESULT").ok();
+    let exit_code: Option<String> = env::var("EXIT_CODE").ok();
+    let exit_status: Option<String> = env::var("EXIT_STATUS").ok();
 
     let track_file_name = match track_mode.as_str() {
         "pre-switch" => "pre_switch",
@@ -85,6 +63,8 @@ fn main() {
 
     let track_directory_path = PathBuf::from_str(&track_directory_path)
         .expect("the directory to keep the tracking files can't be read as a path");
+
+    // TODO: check that `track_directory_path` is actually a directory.
 
     let (user_id, group_id) = get_user_group_id(agent_user)
         .expect("failed to retrieve id of user associated with given user name");

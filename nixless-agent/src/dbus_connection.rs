@@ -89,7 +89,7 @@ impl StartedDBusConnection {
 
     pub async fn perform_configuration_switch(
         &self,
-        system_package_path: String,
+        system_package_path: PathBuf,
     ) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -117,7 +117,7 @@ pub enum DBusConnectionRequest {
         resp_tx: oneshot::Sender<anyhow::Result<bool>>,
     },
     PerformConfigurationSwitch {
-        system_package_path: String,
+        system_package_path: PathBuf,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     WaitConfigurationSwitchComplete {
@@ -158,7 +158,7 @@ async fn dbus_connection_task(
                 resp_tx,
             } => {
                 let activation_command_path =
-                    relative_configuration_activation_command.join(system_package_path);
+                    system_package_path.join(&relative_configuration_activation_command);
 
                 let res = perform_configuration_switch(
                     conn.clone(),
@@ -221,6 +221,7 @@ async fn check_polkit_authorised(conn: Arc<SyncConnection>) -> anyhow::Result<bo
     Ok(is_authorised || is_challenge)
 }
 
+#[tracing::instrument(skip_all)]
 async fn perform_configuration_switch(
     conn: Arc<SyncConnection>,
     activation_command_path: PathBuf,
@@ -234,6 +235,8 @@ async fn perform_configuration_switch(
         Duration::from_millis(1000),
         conn.clone(),
     );
+
+    tracing::info!(activation_command_path = ?activation_command_path.to_str(), "Will start a system switch.");
 
     let aux_not_used: Vec<(String, Vec<(String, Variant<&str>)>)> = Vec::new();
     let transient_service_properties = build_transient_service_properties(
@@ -320,8 +323,6 @@ async fn wait_configuration_switch_complete(conn: Arc<SyncConnection>) -> anyhow
         }
     };
 
-    println!("Unit path is {}", unit_path.to_string());
-
     let unit_proxy = Proxy::new(
         "org.freedesktop.systemd1",
         unit_path,
@@ -394,7 +395,7 @@ fn build_transient_service_properties(
     // a(sasb)
     let exec_start: Vec<(String, Vec<String>, bool)> = vec![(
         activation_command_path_string.clone(),
-        vec![activation_command_path_string],
+        vec![activation_command_path_string, "switch".to_string()],
         false,
     )];
     let exec_start_pre: Vec<(String, Vec<String>, bool)> = vec![(
@@ -417,7 +418,6 @@ fn build_transient_service_properties(
         ],
         false,
     )];
-    // TODO: use $SERVICE_RESULT, $EXIT_CODE and $EXIT_STATUS on ExecStopPost?
     let exec_stop_post: Vec<(String, Vec<String>, bool)> = vec![(
         activation_tracker_command_path_string.clone(),
         vec![
@@ -425,9 +425,6 @@ fn build_transient_service_properties(
             "post-switch".to_string(),
             activation_track_dir_string.clone(),
             "nixless-agent".to_string(),
-            "$SERVICE_RESULT".to_string(),
-            "$EXIT_CODE".to_string(),
-            "$EXIT_STATUS".to_string(),
         ],
         false,
     )];

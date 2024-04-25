@@ -3,13 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixos-generators = {
-      url = "github:nix-community/nixos-generators";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
 
-    attic = {
-      url = "github:zhaofengli/attic";
+    nix-serve-ng = {
+      url = "github:aristanetworks/nix-serve-ng";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -19,7 +15,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, nixos-generators, attic, nil, ... }:
+  outputs = { self, nixpkgs, nix-serve-ng, nil, ... }:
     let
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in
@@ -101,41 +97,12 @@
         # Run `nix build .#.checks.x86_64-linux.normal.driverInteractive` to build an interactive version of the check so you can inspect it if it fails.
         # Inside the interactive session, you can either run the function `test_script()` to run the entire test, or call things individually. It works like a Python REPL. To log into a machine, run `machine_name.shell_interactive()`.
         normal = pkgs.callPackage ./tests/normal.nix {
-          inherit attic;
+          inherit nix-serve-ng;
           nixless-agent-module = import ./service.nix
             {
               inherit (self.packages.x86_64-linux) nixless-agent system-switch-tracker;
             };
         };
-      };
-
-      systems = {
-        nixless =
-          let
-            builtSystem = nixpkgs.lib.nixosSystem {
-              system = "x86_64-linux";
-              modules = [
-                # nixos-generators.nixosModules.qcow-efi
-                nixos-generators.nixosModules.qcow
-                (nixpkgs.outPath + "/nixos/modules/profiles/minimal.nix")
-                (nixpkgs.outPath + "/nixos/modules/profiles/headless.nix")
-                # (nixpkgs.outPath + "/nixos/modules/profiles/perlless.nix")
-                ({ lib, pkgs, ... }: {
-                  # boot.loader.systemd-boot.enable = true;
-
-                  nix. enable = false;
-
-                  services.openssh.enable = true;
-                  services.openssh.settings.PermitRootLogin = "yes";
-                  users.users.root.password = "123456";
-                })
-              ];
-            };
-          in
-          {
-            inherit (builtSystem.config.system.build) toplevel qcow;
-            inherit (builtSystem) options config;
-          };
       };
     };
 }

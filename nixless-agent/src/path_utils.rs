@@ -55,24 +55,29 @@ pub async fn overwrite_symlink_atomically(
     Ok(())
 }
 
-// Usually, the paths are owned by root, so we can't directly delete them. The way we'll do that is by changing the ownership to us, ensuring we can write to the directory/file, and then remove it.
-pub async fn chown_and_remove(path: PathBuf) -> anyhow::Result<()> {
+pub fn set_group_write_perm(path: impl AsRef<Path>) -> anyhow::Result<()> {
+    let path = path.as_ref();
+
+    let attr = std::fs::symlink_metadata(path)?;
+    let mut permissions = attr.permissions();
+
+    if permissions.mode() & 0o020 != 0o020 {
+        permissions.set_mode(permissions.mode() | 0o020);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    Ok(())
+}
+
+#[tracing::instrument]
+pub async fn remove_path(path: PathBuf) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
-    let current_uid = geteuid();
+    tracing::info!("Removing path!");
 
-    chown(&path, Some(current_uid), None)?;
-    let attr = tokio::fs::symlink_metadata(&path).await?;
-    let mut permissions = attr.permissions();
-
-    if permissions.mode() & 0o200 != 0o200 {
-        permissions.set_mode(permissions.mode() | 0o200);
-        tokio::fs::set_permissions(&path, permissions).await?;
-    }
-
-    if attr.is_dir() {
+    if path.is_dir() {
         tokio::fs::remove_dir_all(&path).await?;
     } else {
         tokio::fs::remove_file(&path).await?;
@@ -101,7 +106,7 @@ pub async fn clean_up_nix_var_dir(base_dir: PathBuf) -> anyhow::Result<()> {
 
     let removal_futures: Vec<_> = paths_to_remove
         .drain(..)
-        .map(|path| chown_and_remove(path))
+        .map(|path| remove_path(path))
         .collect();
 
     join_all(removal_futures)

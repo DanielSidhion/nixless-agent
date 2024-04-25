@@ -106,7 +106,8 @@ async fn handle_new_configuration(
     if let Some(system_package_id) = lines.next() {
         tracing::info!(system_package_id, "Got a new system configuration!");
 
-        let package_ids: Vec<_> = lines.map(str::to_string).collect();
+        let mut package_ids: Vec<_> = lines.map(str::to_string).collect();
+        package_ids.push(system_package_id.to_string());
 
         let (resp_tx, resp_rx) = oneshot::channel();
 

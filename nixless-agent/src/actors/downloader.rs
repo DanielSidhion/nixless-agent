@@ -353,6 +353,9 @@ async fn download_one_nar(
         let mut stream_reader = StreamReader::new(resp.bytes_stream().map(|result| {
             result.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
         }));
+
+        // TODO: deal with multiple compression options for the NAR. Remember when "Compression: none" exists.
+
         if let Some(ext) = local_nar_path.extension() {
             if ext == "xz" {
                 local_nar_path = local_nar_path.with_extension("");
@@ -373,11 +376,19 @@ async fn download_one_nar(
             decompressed_hasher.update(chunk);
         });
 
-        let xz_dec = XZDecoder::new(decompressed_inspector)?;
+        let decompresser = if let Some(compression_type) = &nar_info.compression {
+            match compression_type.as_str() {
+                "none" => tokio_util::either::Either::Right(BufWriter::new(decompressed_inspector)),
+                "xz" => tokio_util::either::Either::Left(XZDecoder::new(decompressed_inspector)?),
+                _ => todo!("other compression types not yet implemented"),
+            }
+        } else {
+            todo!("nar info without compression not yet implemented");
+        };
 
         // TODO: In case we don't have a `file_hash`, it would be a good idea to skip doing the hashing here, but the code got somewhat complicated and would need a bit of care to get right.
         let mut compressed_hasher = Sha256::new();
-        let mut compressed_inspector = InspectWriter::new(xz_dec, |chunk| {
+        let mut compressed_inspector = InspectWriter::new(decompresser, |chunk| {
             compressed_hasher.update(chunk);
         });
 

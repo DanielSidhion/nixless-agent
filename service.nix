@@ -47,6 +47,12 @@ in
         '';
         type = lib.types.str;
       };
+      cachePublicKey = lib.mkOption {
+        description = ''
+          The public key of the binary cache.
+        '';
+        type = lib.types.str;
+      };
     };
   };
 
@@ -76,13 +82,14 @@ in
           NIXLESS_AGENT_TEMP_DOWNLOAD_PATH = "/var/lib/nixless-agent/downloads";
           NIXLESS_AGENT_CACHE_URL = cfg.cacheUrl;
           NIXLESS_AGENT_ABSOLUTE_ACTIVATION_TRACKER_COMMAND = lib.getExe system-switch-tracker;
+          NIXLESS_AGENT_CACHE_PUBLIC_KEY = cfg.cachePublicKey;
           RUST_BACKTRACE = "full";
         };
 
         serviceConfig = {
           ExecStart = lib.getExe cfg.package;
-          CapabilityBoundingSet = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP";
-          AmbientCapabilities = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP";
+          CapabilityBoundingSet = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
+          AmbientCapabilities = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
           StateDirectory = "nixless-agent";
           DynamicUser = true;
           User = cfg.user;
@@ -94,6 +101,7 @@ in
           ProtectKernelTunables = true;
           ProtectProc = "default"; # Required so nixless-agent can check whether the nix daemon is running.
           ProtectSystem = "strict";
+          ReadWritePaths = "/nix";
           Restart = "on-failure";
           RestartSec = 10;
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ]; # AF_UNIX is used by D-Bus.
