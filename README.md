@@ -1,3 +1,28 @@
+nixless-agent is a NixOS machine updater which pulls the new system configuration from a binary cache.
+This works differently from most other updaters which push the new configuration into another machine instead.
+
+nixless-agent is intended to be used in a server scenario, ideally one where you don't want operators that have SSH+root access to the machine to push new system configurations, even if those operators are automated instead of being human.
+Because of this, nixless-agent doesn't require SSH access.
+Updates are triggered by sending a request to an HTTP endpoint.
+
+At the moment, this is in pre-alpha stage, and is only tested inside NixOS VM tests.
+
+Major features missing:
+
+- Secure the HTTP endpoint to ensure unwated requests are ignored.
+- Expose metrics that can be monitored from the outside of the host.
+- Perform management and cleanup of old system configurations.
+
+Plenty of minor features are missing as well, but those are too much to be listed here right now.
+
+Note: currently this work is not licensed.
+I want to get the code in a more robust state and finish some of the major features before licensing it.
+If you happen to stumble onto this project and want to use it, please contact me so I can understand if you need anything else that I haven't planned, and so I can be more incentivised to finish the code faster :)
+
+---
+
+# Misc stuff that needs to find another place to live
+
 Helpful tips when hacking on D-Bus stuff:
 
 - You can sniff traffic with `busctl`.
@@ -26,7 +51,7 @@ Helpful tips when hacking on polkit stuff:
   Check if your polkit daemon was started with the `--no-debug` flag, because if it was, you won't be able to see the logs.
   Remove that flag and restart the daemon.
 
-# Terminology
+## Terminology
 
 Nix store dir: usually the `/nix/store` dir.
 
