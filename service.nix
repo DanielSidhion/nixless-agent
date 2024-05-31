@@ -53,6 +53,12 @@ in
         '';
         type = lib.types.str;
       };
+      updatePublicKey = lib.mkOption {
+        description = ''
+          The public key to use when verifying requests made to update the system.
+        '';
+        type = lib.types.str;
+      };
     };
   };
 
@@ -83,6 +89,7 @@ in
           NIXLESS_AGENT_CACHE_URL = cfg.cacheUrl;
           NIXLESS_AGENT_ABSOLUTE_ACTIVATION_TRACKER_COMMAND = lib.getExe system-switch-tracker;
           NIXLESS_AGENT_CACHE_PUBLIC_KEY = cfg.cachePublicKey;
+          NIXLESS_AGENT_UPDATE_PUBLIC_KEY = cfg.updatePublicKey;
           RUST_BACKTRACE = "full";
         };
 

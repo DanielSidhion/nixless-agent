@@ -1369,6 +1369,11 @@ dependencies = [
 [[package]]
 name = "nix-core"
 version = "0.1.0"
+dependencies = [
+ "base64 0.22.0",
+ "ed25519-dalek",
+ "thiserror",
+]
 
 [[package]]
 name = "nix-nar"
@@ -1414,6 +1419,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xz-decoder",
+]
+
+[[package]]
+name = "nixless-request-signer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix-core",
 ]
 
 [[package]]

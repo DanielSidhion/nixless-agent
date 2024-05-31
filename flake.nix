@@ -91,6 +91,23 @@
               maintainers = with pkgs.lib.maintainers; [ danielsidhion ];
             };
           };
+
+          nixless-request-signer = pkgs.rustPlatform.buildRustPackage {
+            pname = "nixless-request-signer";
+            version = "0.1.0";
+
+            src = ./.;
+            buildAndTestSubdir = "nixless-request-signer";
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            meta = {
+              description = "nixless-agent request signer";
+              mainProgram = "nixless-request-signer";
+              maintainers = with pkgs.lib.maintainers; [ danielsidhion ];
+            };
+          };
         };
 
       checks.x86_64-linux = {
@@ -98,6 +115,7 @@
         # Inside the interactive session, you can either run the function `test_script()` to run the entire test, or call things individually. It works like a Python REPL. To log into a machine, run `machine_name.shell_interactive()`.
         normal = pkgs.callPackage ./tests/normal.nix {
           inherit nix-serve-ng;
+          inherit (self.packages.x86_64-linux) nixless-request-signer;
           nixless-agent-module = import ./service.nix
             {
               inherit (self.packages.x86_64-linux) nixless-agent system-switch-tracker;

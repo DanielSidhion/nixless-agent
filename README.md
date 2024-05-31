@@ -1,15 +1,14 @@
-nixless-agent is a NixOS machine updater which pulls the new system configuration from a binary cache.
-This works differently from most other updaters which push the new configuration into another machine instead.
+nixless-agent is a NixOS machine updater for machines that don't want Nix (and its surface area).
+It pulls the new system configuration from a binary cache, which works differently from most other updaters which push the new configuration into another machine instead.
 
 nixless-agent is intended to be used in a server scenario, ideally one where you don't want operators that have SSH+root access to the machine to push new system configurations, even if those operators are automated instead of being human.
 Because of this, nixless-agent doesn't require SSH access.
-Updates are triggered by sending a request to an HTTP endpoint.
+Updates are triggered by sending a signed request to an HTTP endpoint (the signature is how the agent understands what is a valid request).
 
 At the moment, this is in pre-alpha stage, and is only tested inside NixOS VM tests.
 
 Major features missing:
 
-- Secure the HTTP endpoint to ensure unwated requests are ignored.
 - Expose metrics that can be monitored from the outside of the host.
 - Perform management and cleanup of old system configurations.
 

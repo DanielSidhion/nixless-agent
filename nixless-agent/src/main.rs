@@ -18,7 +18,6 @@ mod fingerprint;
 mod owned_nar_info;
 mod path_utils;
 mod process_init;
-mod signing;
 mod state;
 mod system_configuration;
 
@@ -65,6 +64,10 @@ struct Args {
     /// Public key used by the cache in the format "<key_name>:<encoded_key>".
     #[arg(long, env = "NIXLESS_AGENT_CACHE_PUBLIC_KEY")]
     cache_public_key: Option<String>,
+
+    /// Public key used by the system that will request nixless-agent to update. Requests must be signed, and this public key will be used to verify the request. Uses the same format "<key_name>:<encoded_key>" as the cache key.
+    #[arg(long, env = "NIXLESS_AGENT_UPDATE_PUBLIC_KEY")]
+    update_public_key: String,
 
     /// Path to the command used to activate a new system configuration, relative to the configuration top-level package root.
     #[arg(
@@ -150,7 +153,12 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         .build()?
         .start();
 
-    let server = Server::new(args.port, state_keeper.child()).start()?;
+    let server = Server::builder()
+        .port(args.port)
+        .state_keeper(state_keeper.child())
+        .update_public_key(args.update_public_key)
+        .build()?
+        .start()?;
 
     signals_task.await?;
 

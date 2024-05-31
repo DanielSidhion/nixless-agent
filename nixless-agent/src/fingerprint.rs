@@ -2,12 +2,13 @@ use std::iter::repeat_with;
 
 use anyhow::anyhow;
 use narinfo::NarInfo;
+use nix_core::PublicKeychain;
 
-use crate::{owned_nar_info::OwnedNarInfo, signing::CachePublicKeychain};
+use crate::owned_nar_info::OwnedNarInfo;
 
 pub trait Fingerprint {
     fn fingerprint(&self) -> anyhow::Result<String>;
-    fn verify_fingerprint(&self, keychain: &CachePublicKeychain) -> anyhow::Result<bool>;
+    fn verify_fingerprint(&self, keychain: &PublicKeychain) -> anyhow::Result<bool>;
 }
 
 impl Fingerprint for NarInfo<'_> {
@@ -42,7 +43,7 @@ impl Fingerprint for NarInfo<'_> {
         Ok(fingerprint)
     }
 
-    fn verify_fingerprint(&self, keychain: &CachePublicKeychain) -> anyhow::Result<bool> {
+    fn verify_fingerprint(&self, keychain: &PublicKeychain) -> anyhow::Result<bool> {
         let fingerprint = self.fingerprint()?;
         let fingerprint_bytes = fingerprint.as_bytes();
 
@@ -86,7 +87,7 @@ impl Fingerprint for OwnedNarInfo {
         Ok(fingerprint)
     }
 
-    fn verify_fingerprint(&self, keychain: &CachePublicKeychain) -> anyhow::Result<bool> {
+    fn verify_fingerprint(&self, keychain: &PublicKeychain) -> anyhow::Result<bool> {
         let fingerprint = self.fingerprint()?;
         let fingerprint_bytes = fingerprint.as_bytes();
 

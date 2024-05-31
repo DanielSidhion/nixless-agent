@@ -4,12 +4,10 @@ use anyhow::anyhow;
 
 use crate::path_utils::remove_file_with_check;
 
-pub struct SystemSwitchStatus {
-    pub started: bool,
-    pub finished: bool,
-    pub successful: bool,
-
-    pub status_codes: Option<SwitchStatusCodes>,
+pub enum SystemSwitchStatus {
+    Successful { reboot_required: bool },
+    Failed(SwitchStatusCodes),
+    InProgress,
 }
 
 pub struct SwitchStatusCodes {
@@ -18,39 +16,54 @@ pub struct SwitchStatusCodes {
     pub exit_status: String,
 }
 
+/// Will also clean up the tracking files if they exist.
 pub async fn check_switching_status(directory: &PathBuf) -> anyhow::Result<SystemSwitchStatus> {
     let started_path = directory.join("nixless-agent/pre_switch");
     let success_path = directory.join("nixless-agent/switch_success");
     let finish_path = directory.join("nixless-agent/post_switch");
 
     let finished = finish_path.try_exists()?;
-    let status_codes = if finished {
-        let contents = tokio::fs::read_to_string(finish_path).await?;
-        let [service_result, exit_code, exit_status] = contents.lines().collect::<Vec<_>>()[..]
-        else {
-            return Err(anyhow!(
-                "the tracking file for finished status didn't follow the expected format"
-            ));
-        };
+    let started = started_path.try_exists()?;
+    let successful = success_path.try_exists()?;
 
-        Some(SwitchStatusCodes {
-            service_result: service_result.to_string(),
-            exit_code: exit_code.to_string(),
-            exit_status: exit_status.to_string(),
-        })
-    } else {
-        None
-    };
+    match (started, finished, successful) {
+        (true, true, true) => {
+            clean_up_system_switch_tracking_files(directory).await?;
+            Ok(SystemSwitchStatus::Successful {
+                reboot_required: false,
+            })
+        }
+        (true, true, false) => {
+            let status_code_contents = tokio::fs::read_to_string(finish_path).await?;
+            let [service_result, exit_code, exit_status] =
+                status_code_contents.lines().collect::<Vec<_>>()[..]
+            else {
+                return Err(anyhow!(
+                    "the tracking file for finished status didn't follow the expected format"
+                ));
+            };
 
-    Ok(SystemSwitchStatus {
-        started: started_path.try_exists()?,
-        finished,
-        successful: success_path.try_exists()?,
-        status_codes,
-    })
+            clean_up_system_switch_tracking_files(directory).await?;
+
+            if service_result == "exit-code" && exit_status == "100" {
+                Ok(SystemSwitchStatus::Successful {
+                    reboot_required: true,
+                })
+            } else {
+                let status_codes = SwitchStatusCodes {
+                    service_result: service_result.to_string(),
+                    exit_code: exit_code.to_string(),
+                    exit_status: exit_status.to_string(),
+                };
+
+                Ok(SystemSwitchStatus::Failed(status_codes))
+            }
+        }
+        (_, false, _) | (false, _, _) => Ok(SystemSwitchStatus::InProgress),
+    }
 }
 
-pub async fn clean_up_system_switch_tracking_files(directory: &PathBuf) -> anyhow::Result<()> {
+async fn clean_up_system_switch_tracking_files(directory: &PathBuf) -> anyhow::Result<()> {
     let started_path = directory.join("nixless-agent/pre_switch");
     let success_path = directory.join("nixless-agent/switch_success");
     let finish_path = directory.join("nixless-agent/post_switch");

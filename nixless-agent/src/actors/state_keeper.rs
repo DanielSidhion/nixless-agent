@@ -10,9 +10,7 @@ use tracing::instrument;
 use crate::{
     dbus_connection::StartedDBusConnection,
     path_utils::clean_up_nix_var_dir,
-    state::{
-        check_switching_status, clean_up_system_switch_tracking_files, AgentState, AgentStateStatus,
-    },
+    state::{check_switching_status, AgentState, AgentStateStatus, SystemSwitchStatus},
 };
 
 use super::{StartedDownloader, StartedUnpacker};
@@ -127,7 +125,6 @@ async fn state_keeper_task(
     tracing::info!("We might be authorised to manage systemd units, continuing initialisation.");
 
     let mut input_stream = ReceiverStream::new(input_rx);
-    let state_base_dir = state.base_dir();
 
     // If we're here, we just got started, so we'll check what was our previous status and figure out next steps from there.
     match state.status() {
@@ -148,40 +145,7 @@ async fn state_keeper_task(
         }
         AgentStateStatus::SwitchingToConfiguration { .. } => {
             // We must check whether we switched successfully or not. In case the system switch task isn't yet complete, we'll loop again once it is complete so we can evaluate what to do.
-            loop {
-                let switching_status = check_switching_status(&state_base_dir).await?;
-                match (
-                    switching_status.started,
-                    switching_status.finished,
-                    switching_status.successful,
-                ) {
-                    (true, true, true) => {
-                        // TODO: check if we have to reboot due to a kernel or some other thing that changed that requires a reboot. If we do, only consider things successful after the reboot.
-                        clean_up_system_switch_tracking_files(&state_base_dir).await?;
-                        state.mark_new_system_successful().await?;
-                        break;
-                    }
-                    (true, true, false) => {
-                        let status_codes = switching_status.status_codes.unwrap();
-                        if status_codes.service_result == "exit-code"
-                            && status_codes.exit_status == "100"
-                        {
-                            // Switch was "successful", but requires a reboot. Only consider things successful after the reboot.
-                            // TODO: reboot
-                            break;
-                        } else {
-                            // We failed for real. We're in an inconsistent state, so we'll start in a "read-only" mode.
-                            state.mark_new_system_failed().await?;
-                            break;
-                        }
-                    }
-                    (_, false, _) | (false, _, _) => {
-                        dbus_connection.wait_configuration_switch_complete().await?;
-                        // After the wait, we'll continue through the loop so we can evaluate the results once again.
-                        // TODO: detect when we're stuck in an infinite loop and bail.
-                    }
-                }
-            }
+            wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
         }
     }
 
@@ -268,7 +232,7 @@ async fn state_keeper_task(
                                 }
                             }
 
-                            // TODO: check if system switch was made successfully, similar code from the start up of the state keeper.
+                            // We'll check if system switch was made successfully inside the state keeper code instead of this ad-hoc task.
                             input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Ok(()))).await.unwrap();
                         }));
                     }
@@ -279,8 +243,7 @@ async fn state_keeper_task(
                 pending_system_switch_task = None;
             }
             StateKeeperRequest::ConfigurationSwitchResult(Ok(())) => {
-                tracing::info!("System switch completed successfully!");
-                state.mark_new_system_successful().await?;
+                wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
                 pending_system_switch_task = None;
             }
         }
@@ -296,6 +259,34 @@ async fn state_keeper_task(
     if let Some(task) = pending_system_switch_task {
         tracing::info!("We have a pending system switch task, waiting for it to finish.");
         task.await?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_system_update_and_update_state(
+    state: &mut AgentState,
+    dbus_connection: &StartedDBusConnection,
+) -> anyhow::Result<()> {
+    let state_base_dir = state.base_dir();
+
+    loop {
+        match check_switching_status(&state_base_dir).await? {
+            SystemSwitchStatus::Successful { reboot_required } => {
+                // TODO: check if we have to reboot also due to a kernel or some other thing that changed that requires a reboot. If we do, only consider things successful after the reboot. https://github.com/thefossguy/nixos-needsreboot
+                state.mark_new_system_successful().await?;
+                break;
+            }
+            SystemSwitchStatus::InProgress => {
+                dbus_connection.wait_configuration_switch_complete().await?;
+                // After the wait, we'll continue through the loop so we can evaluate the results once again.
+                // TODO: detect when we're stuck in an infinite loop and bail.
+            }
+            SystemSwitchStatus::Failed(_) => {
+                state.mark_new_system_failed().await?;
+                break;
+            }
+        }
     }
 
     Ok(())

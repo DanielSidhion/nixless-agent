@@ -1,11 +1,11 @@
 [package]
-name = "nix-core"
+name = "nixless-request-signer"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
-thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nix-core = { path = "../nix-core" }

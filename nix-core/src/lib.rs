@@ -1,3 +1,7 @@
+mod signing;
+
+pub use signing::*;
+
 /// https://github.com/NixOS/nix/blob/c0b6907ccdaf3d3911cfdb2ff2d000e1683997c7/src/libutil/hash.cc#L90
 /// To go from nix32 to u8, follow this: https://github.com/NixOS/nix/blob/c0b6907ccdaf3d3911cfdb2ff2d000e1683997c7/src/libutil/hash.cc#L231
 pub fn to_nix32(slice: &[u8]) -> String {

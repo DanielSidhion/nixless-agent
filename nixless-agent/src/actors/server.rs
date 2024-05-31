@@ -3,6 +3,8 @@ use actix_web::{
     Responder,
 };
 use anyhow::anyhow;
+use derive_builder::Builder;
+use nix_core::{NixStylePublicKey, PublicKeychain};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -12,25 +14,34 @@ use tracing::instrument;
 
 use super::StartedStateKeeper;
 
+#[derive(Builder)]
+#[builder(pattern = "owned")]
 pub struct Server {
     port: u16,
     state_keeper: StartedStateKeeper,
+    update_public_key: String,
 }
 
 impl Server {
-    pub fn new(port: u16, state_keeper: StartedStateKeeper) -> Self {
-        Self { port, state_keeper }
+    pub fn builder() -> ServerBuilder {
+        ServerBuilder::default()
     }
 
     pub fn start(self) -> anyhow::Result<StartedServer> {
+        let mut keychain = PublicKeychain::new();
+        let public_key = NixStylePublicKey::from_nix_format(&self.update_public_key)?;
+        keychain.add_key(public_key)?;
+
         let (input_tx, input_rx) = mpsc::channel(10);
 
         let inputs_task = tokio::spawn(server_task(input_rx, self.state_keeper));
 
         let inputs_sender = web::Data::new(input_tx.clone());
+        let keychain = web::Data::new(keychain);
         let server_task = HttpServer::new(move || {
             App::new()
                 .app_data(inputs_sender.clone())
+                .app_data(keychain.clone())
                 .route(
                     "/new-configuration",
                     web::post().to(handle_new_configuration),
@@ -100,14 +111,31 @@ async fn handle_new_configuration(
     req: HttpRequest,
     payload_string: String,
     inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
+    keychain: web::Data<PublicKeychain>,
 ) -> actix_web::Result<impl Responder> {
     let mut lines = payload_string.lines();
 
     if let Some(system_package_id) = lines.next() {
-        tracing::info!(system_package_id, "Got a new system configuration!");
+        tracing::info!(system_package_id, "Got a new system configuration request!");
 
         let mut package_ids: Vec<_> = lines.map(str::to_string).collect();
+        // Last item is actually the signature instead of a package id.
+        let signature = package_ids.pop();
         package_ids.push(system_package_id.to_string());
+
+        let Some(signature) = signature else {
+            tracing::info!("Request didn't have a signature included!");
+            return Ok(HttpResponse::BadRequest().finish());
+        };
+
+        let signed_data = payload_string.trim().trim_end_matches(&signature).trim();
+        let signature_ok = keychain
+            .verify_any(signed_data.as_bytes(), signature.as_bytes())
+            .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+
+        if !signature_ok {
+            return Ok(HttpResponse::BadRequest().finish());
+        }
 
         let (resp_tx, resp_rx) = oneshot::channel();
 

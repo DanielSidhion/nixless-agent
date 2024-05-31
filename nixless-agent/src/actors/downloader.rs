@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use derive_builder::Builder;
 use futures::StreamExt;
 use narinfo::{NarInfo, NixCacheInfo};
-use nix_core::to_nix32;
+use nix_core::{to_nix32, NixStylePublicKey, PublicKeychain};
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -19,10 +19,7 @@ use tracing::instrument;
 use xz_decoder::XZDecoder;
 
 use crate::{
-    fingerprint::Fingerprint,
-    owned_nar_info::OwnedNarInfo,
-    path_utils::collect_nix_store_packages,
-    signing::{CachePublicKey, CachePublicKeychain},
+    fingerprint::Fingerprint, owned_nar_info::OwnedNarInfo, path_utils::collect_nix_store_packages,
 };
 
 #[derive(Builder)]
@@ -125,7 +122,7 @@ async fn downloader_task(
     cache_public_key: Option<String>,
     input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
-    let mut keychain = CachePublicKeychain::with_known_keys()?;
+    let mut keychain = PublicKeychain::with_known_keys()?;
 
     if let Some(cache_public_key) = cache_public_key {
         tracing::info!(
@@ -133,7 +130,7 @@ async fn downloader_task(
             "Adding the configured public key of the binary cache as a trusted key."
         );
 
-        keychain.add_key(CachePublicKey::from_nix_format(&cache_public_key)?)?;
+        keychain.add_key(NixStylePublicKey::from_nix_format(&cache_public_key)?)?;
     }
 
     tracing::info!(
@@ -306,7 +303,7 @@ async fn download_one_nar(
     download_dir: &PathBuf,
     cache_url: &str,
     package_id: String,
-    keychain: &CachePublicKeychain,
+    keychain: &PublicKeychain,
 ) -> anyhow::Result<NarDownloadResult> {
     let nar_info = download_nar_info(&client, cache_url, &package_id).await?;
 

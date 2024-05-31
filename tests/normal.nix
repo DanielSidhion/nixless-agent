@@ -1,4 +1,4 @@
-{ nix-serve-ng, nixless-agent-module, pkgs }:
+{ nix-serve-ng, nixless-agent-module, nixless-request-signer, pkgs, lib }:
 let
   nixServeNgModule = nix-serve-ng.nixosModules.default;
   nixosLib = import (pkgs.path + "/nixos/lib") { };
@@ -9,6 +9,7 @@ let
     echo ${newTestMachineTopLevel} >> $out
     ${pkgs.lib.getExe pkgs.gnugrep} -v '${newTestMachineTopLevel}' ${newTestMachineClosure} >> $out
     ${pkgs.lib.getExe pkgs.gnused} -i 's/\/nix\/store\///g' $out
+    ${lib.getExe nixless-request-signer} sign --private-key-encoded 'test-cache:a9OHZ2CtyxOaAVJSIgvBa7QgW/ejKh2QLvXC1oXMlK+NaFGRIiOn87UsbjRx5RiaW/a0gOia+RS323buii8wFQ==' --file-path $out >> $out
   '';
 
   newFileContents = "This proves the machine got updated to the new configuration.";
@@ -52,7 +53,7 @@ let
       test_machine.start()
       test_machine.wait_for_unit("nixless-agent.service")
 
-      binary_cache.succeed("curl -i -X POST --data-binary @${newTestMachineClosureSorted} http://test_machine:56321/new-configuration")
+      binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${newTestMachineClosureSorted} http://test_machine:56321/new-configuration")
       test_machine.wait_for_file("/etc/new-test-machine-tracker", 20000)
       file_contents = test_machine.succeed("cat /etc/new-test-machine-tracker")
 

@@ -14,6 +14,8 @@
     enable = true;
     cacheUrl = "http://binary_cache:8090";
     cachePublicKey = "test-cache:jWhRkSIjp/O1LG40ceUYmlv2tIDomvkUt9t27oovMBU=";
+    # We reuse the same cache key here because it doesn't really matter in this test scenario - but in production this should never be the case!
+    updatePublicKey = "test-cache:jWhRkSIjp/O1LG40ceUYmlv2tIDomvkUt9t27oovMBU=";
     port = 56321;
   };
 
