@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::{anyhow, Context};
 use derive_builder::Builder;
@@ -33,7 +33,7 @@ pub struct Downloader {
 
 pub enum DownloaderRequest {
     DownloadPackages {
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<Vec<NarDownloadResult>>>,
     },
 }
@@ -61,7 +61,7 @@ impl StartedDownloader {
 
     pub async fn download_packages(
         &self,
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
     ) -> anyhow::Result<Vec<NarDownloadResult>> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -177,12 +177,11 @@ async fn downloader_task(
             .map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
 
         if nix_cache_info.store_dir != nix_store_dir {
-            // TODO: re-enable this.
-            // return Err(anyhow!(
-            //     "Cache has a store path different from ours. Got {}, expected {}",
-            //     nix_cache_info.store_dir,
-            //     store_path
-            // ));
+            return Err(anyhow!(
+                "Cache has a store path different from ours. Got {}, expected {}",
+                nix_cache_info.store_dir,
+                nix_store_dir
+            ));
         } else {
             tracing::debug!("Cache store path matches ours! Continuing.");
         }
@@ -380,7 +379,7 @@ async fn download_one_nar(
                 _ => todo!("other compression types not yet implemented"),
             }
         } else {
-            todo!("nar info without compression not yet implemented");
+            tokio_util::either::Either::Right(BufWriter::new(decompressed_inspector))
         };
 
         // TODO: In case we don't have a `file_hash`, it would be a good idea to skip doing the hashing here, but the code got somewhat complicated and would need a bit of care to get right.

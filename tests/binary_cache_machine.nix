@@ -1,4 +1,4 @@
-{ nixServeNgModule }:
+{ nixServeNgModule, testPrivateKey }:
 { modulesPath, pkgs, ... }:
 {
   imports = [
@@ -8,8 +8,7 @@
   ];
 
   virtualisation.graphics = false;
-
-  environment.etc.nixServeSecretKey.text = "test-cache:a9OHZ2CtyxOaAVJSIgvBa7QgW/ejKh2QLvXC1oXMlK+NaFGRIiOn87UsbjRx5RiaW/a0gOia+RS323buii8wFQ==";
+  environment.etc.nixServeSecretKey.text = testPrivateKey;
 
   services.nix-serve = {
     enable = true;

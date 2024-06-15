@@ -1,4 +1,4 @@
-{ nixless-agent-module }:
+{ nixless-agent-module, testPublicKey }:
 { modulesPath, ... }:
 {
   imports = [
@@ -7,15 +7,16 @@
     (modulesPath + "/profiles/headless.nix")
   ];
 
+  system.stateVersion = "24.05";
   nix.enable = false;
 
   networking.firewall.allowedTCPPorts = [ 56321 ];
   services.nixless-agent = {
     enable = true;
     cacheUrl = "http://binary_cache:8090";
-    cachePublicKey = "test-cache:jWhRkSIjp/O1LG40ceUYmlv2tIDomvkUt9t27oovMBU=";
+    cachePublicKey = testPublicKey;
     # We reuse the same cache key here because it doesn't really matter in this test scenario - but in production this should never be the case!
-    updatePublicKey = "test-cache:jWhRkSIjp/O1LG40ceUYmlv2tIDomvkUt9t27oovMBU=";
+    updatePublicKey = testPublicKey;
     port = 56321;
   };
 

@@ -110,17 +110,19 @@
           };
         };
 
-      checks.x86_64-linux = {
-        # Run `nix build .#.checks.x86_64-linux.normal.driverInteractive` to build an interactive version of the check so you can inspect it if it fails.
-        # Inside the interactive session, you can either run the function `test_script()` to run the entire test, or call things individually. It works like a Python REPL. To log into a machine, run `machine_name.shell_interactive()`.
-        normal = pkgs.callPackage ./tests/normal.nix {
-          inherit nix-serve-ng;
-          inherit (self.packages.x86_64-linux) nixless-request-signer;
-          nixless-agent-module = import ./service.nix
-            {
-              inherit (self.packages.x86_64-linux) nixless-agent system-switch-tracker;
-            };
-        };
-      };
+      checks.x86_64-linux =
+        let
+          # Run `nix build .#.checks.x86_64-linux.<test_name>.driverInteractive` to build an interactive version of the check so you can inspect it if it fails.
+          # Inside the interactive session, you can either run the function `test_script()` to run the entire test, or call things individually. It works like a Python REPL. To log into a machine, run `machine_name.shell_interactive()`.
+          nixless-agent-tests = pkgs.callPackage ./tests/default.nix {
+            inherit nix-serve-ng;
+            inherit (self.packages.x86_64-linux) nixless-request-signer;
+            nixless-agent-module = import ./service.nix
+              {
+                inherit (self.packages.x86_64-linux) nixless-agent system-switch-tracker;
+              };
+          };
+        in
+        nixless-agent-tests;
     };
 }

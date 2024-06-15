@@ -1,13 +1,14 @@
 use std::{
     collections::HashSet,
     ffi::OsStr,
-    os::unix::fs::PermissionsExt,
+    fs::read_dir,
+    os::unix::fs::{lchown, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use anyhow::anyhow;
 use futures::future::join_all;
-use nix::unistd::{chown, geteuid};
+use nix::unistd::{chown, getegid, geteuid};
 use tracing::instrument;
 
 pub fn get_number_from_numbered_system_name(name: &OsStr) -> anyhow::Result<u32> {
@@ -69,18 +70,53 @@ pub fn set_group_write_perm(path: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn set_user_write_perm(path: impl AsRef<Path>) -> anyhow::Result<()> {
+    let path = path.as_ref();
+
+    let attr = std::fs::symlink_metadata(path)?;
+    let mut permissions = attr.permissions();
+
+    if permissions.mode() & 0o200 != 0o200 {
+        permissions.set_mode(permissions.mode() | 0o200);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    Ok(())
+}
+
 #[tracing::instrument]
 pub async fn remove_path(path: PathBuf) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
-    tracing::info!("Removing path!");
-
     if path.is_dir() {
         tokio::fs::remove_dir_all(&path).await?;
     } else {
         tokio::fs::remove_file(&path).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn remove_readonly_path(path: PathBuf) -> anyhow::Result<()> {
+    let current_uid = geteuid();
+    mark_path_writable_recursive(&path, current_uid.as_raw())?;
+    remove_path(path).await
+}
+
+#[tracing::instrument(skip_all)]
+fn mark_path_writable_recursive(path: &PathBuf, uid: u32) -> anyhow::Result<()> {
+    lchown(path, Some(uid), None)?;
+    set_user_write_perm(path)?;
+
+    // `path.is_dir()` traverses symlinks, so we gotta explicitly check for a symlink and stop on them as well to avoid infinite recursion.
+    if path.is_symlink() || !path.is_dir() {
+        return Ok(());
+    }
+
+    for entry in read_dir(path)? {
+        mark_path_writable_recursive(&entry?.path(), uid)?;
     }
 
     Ok(())

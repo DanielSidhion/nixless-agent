@@ -1,10 +1,13 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{collections::HashSet, path::PathBuf, str::FromStr};
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path_utils::{get_number_from_numbered_system_name, overwrite_symlink_atomically_with_check},
+    path_utils::{
+        collect_nix_store_packages, get_number_from_numbered_system_name,
+        overwrite_symlink_atomically_with_check,
+    },
     system_configuration::SystemConfiguration,
 };
 
@@ -59,9 +62,21 @@ pub struct AgentState {
     nixless_state_dir: PathBuf,
     #[serde(skip)]
     state_file_path: PathBuf,
+    #[serde(skip)]
+    max_system_history_count: usize,
 
     system_configurations: Vec<SystemConfiguration>,
     current_status: AgentStateStatus,
+    // When cleaning up old configurations, we don't immediately remove the packages from disk, and instead keep track of them in this Vec. Removing the packages from disk happens asynchronously and is started by the state keeper, not this state object.
+    packages_to_cleanup: HashSet<String>,
+}
+
+// If we can't determine the configuration of the system, we'll use this instead.
+async fn build_tombstone_value(nix_store_dir: &str) -> anyhow::Result<SystemConfiguration> {
+    let existing_package_ids = collect_nix_store_packages(nix_store_dir).await?;
+    let mut tombstone = SystemConfiguration::tombstone();
+    tombstone.package_ids = existing_package_ids;
+    Ok(tombstone)
 }
 
 impl AgentState {
@@ -104,6 +119,7 @@ impl AgentState {
         nix_store_dir: String,
         nix_state_base_dir: PathBuf,
         nixless_state_dir: PathBuf,
+        max_system_history_count: usize,
     ) -> anyhow::Result<Self> {
         let state_file_path = Self::absolute_state_path_associated(&nixless_state_dir);
 
@@ -113,6 +129,7 @@ impl AgentState {
                 nix_state_base_dir,
                 nixless_state_dir,
                 state_file_path,
+                max_system_history_count,
             )
             .await
         } else {
@@ -123,6 +140,7 @@ impl AgentState {
             state.nix_state_base_dir = nix_state_base_dir;
             state.nixless_state_dir = nixless_state_dir;
             state.state_file_path = state_file_path;
+            state.max_system_history_count = max_system_history_count;
             Ok(state)
         }
     }
@@ -133,22 +151,15 @@ impl AgentState {
         nix_state_base_dir: PathBuf,
         nixless_state_dir: PathBuf,
         state_file_path: PathBuf,
+        max_system_history_count: usize,
     ) -> anyhow::Result<Self> {
-        // Will be used if we can't determine the configuration of the current system.
-        let build_tombstone_value = || -> anyhow::Result<SystemConfiguration> {
-            Ok(SystemConfiguration::builder()
-                .version_number(0)
-                .system_package_id("unknown".to_string())
-                .build()?)
-        };
-
         let current_configuration = match tokio::fs::canonicalize(Self::current_system_path()).await
         {
-            Err(_) => build_tombstone_value()?,
+            Err(_) => build_tombstone_value(&nix_store_dir).await?,
             Ok(current_version_path)
                 if !current_version_path.exists() || !current_version_path.is_dir() =>
             {
-                build_tombstone_value()?
+                build_tombstone_value(&nix_store_dir).await?
             }
             Ok(current_system_package_path) => {
                 // We don't want to throw an error if we can't convert it to a utf-8 string, we'll just use the tombstone value instead.
@@ -171,7 +182,7 @@ impl AgentState {
                         )
                         .build()?
                 } else {
-                    build_tombstone_value()?
+                    build_tombstone_value(&nix_store_dir).await?
                 }
             }
         };
@@ -181,8 +192,10 @@ impl AgentState {
             nix_state_base_dir,
             nixless_state_dir,
             state_file_path,
+            max_system_history_count,
             system_configurations: vec![current_configuration],
             current_status: AgentStateStatus::New,
+            packages_to_cleanup: HashSet::new(),
         })
     }
 
@@ -322,7 +335,7 @@ impl AgentState {
     pub fn mark_switching_new_system(
         &mut self,
         system_package_id: String,
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
     ) -> anyhow::Result<()> {
         if !matches!(self.current_status, AgentStateStatus::Standby) {
             return Err(anyhow!(
@@ -342,7 +355,7 @@ impl AgentState {
             configuration: new_configuration,
         };
 
-        Ok(())
+        self.save()
     }
 
     fn save(&self) -> anyhow::Result<()> {
@@ -381,5 +394,78 @@ impl AgentState {
         } else {
             Ok(current_version_number)
         }
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn cleanup_configuration_history(&mut self) -> anyhow::Result<()> {
+        if !matches!(self.current_status, AgentStateStatus::Standby) {
+            return Err(anyhow!(
+                "state is not in standby, so can't proceed with cleanup of configuration history"
+            ));
+        }
+
+        let tracked_valid_configurations = if self.system_configurations[0].is_tombstone() {
+            self.system_configurations.len() - 1
+        } else {
+            self.system_configurations.len()
+        };
+
+        if tracked_valid_configurations <= self.max_system_history_count {
+            return Ok(());
+        }
+
+        tracing::info!(
+            tracked_valid_configurations,
+            "Will cleanup some configuration history."
+        );
+
+        let num_configs_to_remove = tracked_valid_configurations - self.max_system_history_count;
+        let removed_configs: Vec<_> = self
+            .system_configurations
+            .drain(..num_configs_to_remove)
+            .collect();
+
+        let remaining_configs = self.system_configurations.len();
+        tracing::info!(
+            num_configs_to_remove,
+            remaining_configs,
+            "Removed some configs from the history, will group packages now."
+        );
+
+        // Idea is to add all packages from the removed configurations to a set, and then go over all the configurations we're still tracking in the state and remove all packages in those from the set - this should give us a set with all packages that were ONLY in the configurations that we removed.
+        let mut packages_from_removed_configs = HashSet::new();
+        for config in removed_configs {
+            tracing::info!(config.system_package_id, "Adding packages to be removed");
+            packages_from_removed_configs.insert(config.system_package_id);
+            packages_from_removed_configs.extend(config.package_ids.into_iter());
+        }
+
+        for config in self.system_configurations.iter() {
+            tracing::info!(config.system_package_id, "Removing packages to be removed");
+            packages_from_removed_configs.remove(&config.system_package_id);
+
+            for pkg in config.package_ids.iter() {
+                packages_from_removed_configs.remove(pkg);
+            }
+        }
+
+        self.packages_to_cleanup
+            .extend(packages_from_removed_configs.into_iter());
+
+        self.repair_profile_links().await?;
+        Ok(())
+    }
+
+    pub fn has_packages_to_cleanup(&self) -> bool {
+        !self.packages_to_cleanup.is_empty()
+    }
+
+    pub fn packages_to_cleanup(&self) -> HashSet<String> {
+        self.packages_to_cleanup.clone()
+    }
+
+    pub async fn clear_packages_to_cleanup(&mut self) -> anyhow::Result<()> {
+        self.packages_to_cleanup.clear();
+        self.save()
     }
 }

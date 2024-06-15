@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::anyhow;
 use derive_builder::Builder;
 use tokio::{
@@ -13,7 +15,7 @@ use crate::{
     state::{check_switching_status, AgentState, AgentStateStatus, SystemSwitchStatus},
 };
 
-use super::{StartedDownloader, StartedUnpacker};
+use super::{StartedDeleter, StartedDownloader, StartedUnpacker};
 
 #[derive(Builder)]
 #[builder(pattern = "owned")]
@@ -22,6 +24,7 @@ pub struct StateKeeper {
     dbus_connection: StartedDBusConnection,
     downloader: StartedDownloader,
     unpacker: StartedUnpacker,
+    deleter: StartedDeleter,
 }
 
 impl StateKeeper {
@@ -39,6 +42,7 @@ impl StateKeeper {
                 self.dbus_connection,
                 self.downloader,
                 self.unpacker,
+                self.deleter,
                 input_rx,
                 input_tx_clone,
             )
@@ -67,10 +71,13 @@ enum StateKeeperRequest {
     CleanUpStateDirResult(anyhow::Result<()>),
     SwitchToNewConfiguration {
         system_package_id: String,
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     ConfigurationSwitchResult(anyhow::Result<()>),
+    CleanupConfigurationHistory,
+    PackageDeletionResult(anyhow::Result<()>),
+    // TODO: add a message to sweep the nix store dir and check for any foreign packages.
 }
 
 pub struct StartedStateKeeper {
@@ -89,7 +96,7 @@ impl StartedStateKeeper {
     pub async fn switch_to_new_configuration(
         &self,
         system_package_id: String,
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
     ) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -111,6 +118,7 @@ async fn state_keeper_task(
     dbus_connection: StartedDBusConnection,
     downloader: StartedDownloader,
     unpacker: StartedUnpacker,
+    deleter: StartedDeleter,
     input_rx: mpsc::Receiver<StateKeeperRequest>,
     input_tx: mpsc::Sender<StateKeeperRequest>,
 ) -> anyhow::Result<()> {
@@ -144,8 +152,11 @@ async fn state_keeper_task(
                 .await?;
         }
         AgentStateStatus::SwitchingToConfiguration { .. } => {
-            // We must check whether we switched successfully or not. In case the system switch task isn't yet complete, we'll loop again once it is complete so we can evaluate what to do.
-            wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
+            // TODO: rename `ConfigurationSwitchResult` to something different, because it's not the result of actually making the configuration switch, but the result of "starting" the switch.
+            input_tx
+                .send(StateKeeperRequest::ConfigurationSwitchResult(Ok(())))
+                .await
+                .unwrap();
         }
     }
 
@@ -153,6 +164,7 @@ async fn state_keeper_task(
 
     let mut pending_clean_up_task: Option<JoinHandle<()>> = None;
     let mut pending_system_switch_task: Option<JoinHandle<()>> = None;
+    let mut pending_package_delete_task: Option<JoinHandle<()>> = None;
 
     while let Some(req) = input_stream.next().await {
         match req {
@@ -182,6 +194,11 @@ async fn state_keeper_task(
                 package_ids,
                 resp_tx,
             } => {
+                tracing::info!(
+                    system_package_id,
+                    "State keeper got a request to switch to new configuration."
+                );
+
                 match state.status() {
                     AgentStateStatus::New | AgentStateStatus::Temporary => unreachable!("should have never been in a new or temporary state during the state keeper main loop"),
                     AgentStateStatus::FailedSwitch { .. } => {
@@ -243,8 +260,39 @@ async fn state_keeper_task(
                 pending_system_switch_task = None;
             }
             StateKeeperRequest::ConfigurationSwitchResult(Ok(())) => {
+                tracing::info!("Configuration switch was successful!");
                 wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
                 pending_system_switch_task = None;
+                tracing::info!("State updated!");
+
+                input_tx
+                    .send(StateKeeperRequest::CleanupConfigurationHistory)
+                    .await?;
+            }
+            StateKeeperRequest::CleanupConfigurationHistory => {
+                tracing::info!("Cleaning up configuration history.");
+                state.cleanup_configuration_history().await?;
+
+                if state.has_packages_to_cleanup() {
+                    let input_tx_clone = input_tx.clone();
+                    let deleter_clone = deleter.child();
+                    let packages_to_cleanup = state.packages_to_cleanup();
+                    pending_package_delete_task = Some(tokio::spawn(async move {
+                        let res = deleter_clone.delete_packages(packages_to_cleanup).await;
+                        input_tx_clone
+                            .send(StateKeeperRequest::PackageDeletionResult(res))
+                            .await
+                            .unwrap();
+                    }));
+                }
+            }
+            StateKeeperRequest::PackageDeletionResult(Ok(())) => {
+                state.clear_packages_to_cleanup().await?;
+                pending_package_delete_task = None;
+            }
+            StateKeeperRequest::PackageDeletionResult(Err(err)) => {
+                tracing::error!(?err, "We failed to delete some packages to cleanup!");
+                pending_package_delete_task = None;
             }
         }
     }
@@ -258,6 +306,11 @@ async fn state_keeper_task(
 
     if let Some(task) = pending_system_switch_task {
         tracing::info!("We have a pending system switch task, waiting for it to finish.");
+        task.await?;
+    }
+
+    if let Some(task) = pending_package_delete_task {
+        tracing::info!("We have a pending package deletion task, waiting for it to finish.");
         task.await?;
     }
 

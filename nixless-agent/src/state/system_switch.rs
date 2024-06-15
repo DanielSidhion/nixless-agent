@@ -18,9 +18,9 @@ pub struct SwitchStatusCodes {
 
 /// Will also clean up the tracking files if they exist.
 pub async fn check_switching_status(directory: &PathBuf) -> anyhow::Result<SystemSwitchStatus> {
-    let started_path = directory.join("nixless-agent/pre_switch");
-    let success_path = directory.join("nixless-agent/switch_success");
-    let finish_path = directory.join("nixless-agent/post_switch");
+    let started_path = directory.join("pre_switch");
+    let success_path = directory.join("switch_success");
+    let finish_path = directory.join("post_switch");
 
     let finished = finish_path.try_exists()?;
     let started = started_path.try_exists()?;
@@ -64,9 +64,9 @@ pub async fn check_switching_status(directory: &PathBuf) -> anyhow::Result<Syste
 }
 
 async fn clean_up_system_switch_tracking_files(directory: &PathBuf) -> anyhow::Result<()> {
-    let started_path = directory.join("nixless-agent/pre_switch");
-    let success_path = directory.join("nixless-agent/switch_success");
-    let finish_path = directory.join("nixless-agent/post_switch");
+    let started_path = directory.join("pre_switch");
+    let success_path = directory.join("switch_success");
+    let finish_path = directory.join("post_switch");
 
     let (r1, r2, r3) = tokio::join!(
         remove_file_with_check(started_path),

@@ -59,6 +59,13 @@ in
         '';
         type = lib.types.str;
       };
+      maxSystemHistoryCount = lib.mkOption {
+        description = ''
+          How many configurations the agent will keep in the machine (for rollbacks, for example).
+        '';
+        type = lib.types.ints.positive;
+        default = 3;
+      };
     };
   };
 
@@ -79,6 +86,17 @@ in
         '';
       };
 
+      users.users = lib.optionalAttrs (cfg.user == "nixless-agent") {
+        nixless-agent = {
+          group = cfg.group;
+          isSystemUser = true;
+        };
+      };
+
+      users.groups = lib.optionalAttrs (cfg.group == "nixless-agent") {
+        nixless-agent.members = [ cfg.user ];
+      };
+
       systemd.services.nixless-agent = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
@@ -90,6 +108,7 @@ in
           NIXLESS_AGENT_ABSOLUTE_ACTIVATION_TRACKER_COMMAND = lib.getExe system-switch-tracker;
           NIXLESS_AGENT_CACHE_PUBLIC_KEY = cfg.cachePublicKey;
           NIXLESS_AGENT_UPDATE_PUBLIC_KEY = cfg.updatePublicKey;
+          NIXLESS_MAX_SYSTEM_HISTORY_COUNT = builtins.toString cfg.maxSystemHistoryCount;
           RUST_BACKTRACE = "full";
         };
 
@@ -98,7 +117,7 @@ in
           CapabilityBoundingSet = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
           AmbientCapabilities = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
           StateDirectory = "nixless-agent";
-          DynamicUser = true;
+          DynamicUser = false;
           User = cfg.user;
           Group = cfg.group;
           ProtectHome = true;
@@ -107,9 +126,11 @@ in
           ProtectKernelModules = true;
           ProtectKernelTunables = true;
           ProtectProc = "default"; # Required so nixless-agent can check whether the nix daemon is running.
+          ProcSubset = "pid";
           ProtectSystem = "strict";
           ReadWritePaths = "/nix";
-          Restart = "on-failure";
+          # Restart = "on-failure";
+          Restart = "no";
           RestartSec = 10;
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ]; # AF_UNIX is used by D-Bus.
           RestrictNamespaces = "mnt";

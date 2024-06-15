@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use actix_web::{
     error::InternalError, http::StatusCode, web, App, HttpRequest, HttpResponse, HttpServer,
     Responder,
@@ -72,7 +74,7 @@ pub struct StartedServer {
 pub enum ServerRequest {
     UpdateSystem {
         system_package_id: String,
-        package_ids: Vec<String>,
+        package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -118,10 +120,11 @@ async fn handle_new_configuration(
     if let Some(system_package_id) = lines.next() {
         tracing::info!(system_package_id, "Got a new system configuration request!");
 
+        // A bit convoluted since we first need to grab the last line (which is the signature) and remove it from the list of package ids, and only then turn the list into a set.
         let mut package_ids: Vec<_> = lines.map(str::to_string).collect();
-        // Last item is actually the signature instead of a package id.
         let signature = package_ids.pop();
         package_ids.push(system_package_id.to_string());
+        let package_ids = HashSet::from_iter(package_ids.into_iter());
 
         let Some(signature) = signature else {
             tracing::info!("Request didn't have a signature included!");
@@ -138,6 +141,8 @@ async fn handle_new_configuration(
         }
 
         let (resp_tx, resp_rx) = oneshot::channel();
+
+        tracing::info!("Sending server request to update the system.");
 
         inputs_sender
             .send(ServerRequest::UpdateSystem {

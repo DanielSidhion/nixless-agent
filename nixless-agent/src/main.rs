@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use actors::{Downloader, Server, StateKeeper, Unpacker};
+use actors::{Deleter, Downloader, Server, StateKeeper, Unpacker};
 use anyhow::anyhow;
 use clap::Parser;
 use dbus_connection::DBusConnection;
@@ -77,6 +77,9 @@ struct Args {
     )]
     relative_configuration_activation_command: PathBuf,
 
+    #[arg(long, default_value_t = 3, env = "NIXLESS_MAX_SYSTEM_HISTORY_COUNT")]
+    max_system_history_count: usize,
+
     /// Full path to the command used to track configuration activation. This command will be called in the following ways:
     /// - <command> pre-switch <track_directory> <user>
     /// - <command> switch-success <track_directory> <user>
@@ -121,6 +124,7 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         store_path_string.clone(),
         args.nix_state_dir,
         args.nixless_state_dir,
+        args.max_system_history_count,
     )
     .await?;
 
@@ -145,11 +149,17 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         .build()?;
     let unpacker = unpacker.start();
 
+    let deleter = Deleter::builder()
+        .nix_store_dir(args.nix_store_dir.clone())
+        .build()?;
+    let deleter = deleter.start();
+
     let state_keeper = StateKeeper::builder()
         .state(state)
         .dbus_connection(dbus_connection)
         .downloader(downloader)
         .unpacker(unpacker)
+        .deleter(deleter)
         .build()?
         .start();
 
