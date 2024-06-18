@@ -12,7 +12,9 @@ use tracing::instrument;
 use crate::{
     dbus_connection::StartedDBusConnection,
     path_utils::clean_up_nix_var_dir,
-    state::{check_switching_status, AgentState, AgentStateStatus, SystemSwitchStatus},
+    state::{
+        check_switching_status, AgentState, AgentStateStatus, SystemSummary, SystemSwitchStatus,
+    },
 };
 
 use super::{StartedDeleter, StartedDownloader, StartedUnpacker};
@@ -77,6 +79,9 @@ enum StateKeeperRequest {
     ConfigurationSwitchResult(anyhow::Result<()>),
     CleanupConfigurationHistory,
     PackageDeletionResult(anyhow::Result<()>),
+    GetSummary {
+        resp_tx: oneshot::Sender<anyhow::Result<SystemSummary>>,
+    },
     // TODO: add a message to sweep the nix store dir and check for any foreign packages.
 }
 
@@ -106,6 +111,16 @@ impl StartedStateKeeper {
                 package_ids,
                 resp_tx,
             })
+            .await?;
+
+        resp_rx.await?
+    }
+
+    pub async fn get_summary(&self) -> anyhow::Result<SystemSummary> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.input_tx
+            .send(StateKeeperRequest::GetSummary { resp_tx })
             .await?;
 
         resp_rx.await?
@@ -293,6 +308,9 @@ async fn state_keeper_task(
             StateKeeperRequest::PackageDeletionResult(Err(err)) => {
                 tracing::error!(?err, "We failed to delete some packages to cleanup!");
                 pending_package_delete_task = None;
+            }
+            StateKeeperRequest::GetSummary { resp_tx } => {
+                resp_tx.send(Ok(state.summary())).unwrap();
             }
         }
     }

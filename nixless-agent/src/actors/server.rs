@@ -1,18 +1,21 @@
 use std::collections::HashSet;
 
 use actix_web::{
-    error::InternalError, http::StatusCode, web, App, HttpRequest, HttpResponse, HttpServer,
-    Responder,
+    error::InternalError, http::StatusCode, web, App, Either, HttpRequest, HttpResponse,
+    HttpServer, Responder,
 };
 use anyhow::anyhow;
 use derive_builder::Builder;
 use nix_core::{NixStylePublicKey, PublicKeychain};
+use serde_json::json;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::instrument;
+
+use crate::state::SystemSummary;
 
 use super::StartedStateKeeper;
 
@@ -44,6 +47,7 @@ impl Server {
             App::new()
                 .app_data(inputs_sender.clone())
                 .app_data(keychain.clone())
+                .route("/summary", web::get().to(retrieve_system_summary))
                 .route(
                     "/new-configuration",
                     web::post().to(handle_new_configuration),
@@ -77,8 +81,12 @@ pub enum ServerRequest {
         package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    GetSystemSummary {
+        resp_tx: oneshot::Sender<anyhow::Result<SystemSummary>>,
+    },
 }
 
+// TODO: this is acting as a buffer task right now - think better whether it makes sense to just expose the `state_keeper` inside each handler of the server instead.
 #[instrument(skip_all)]
 async fn server_task(
     input_rx: mpsc::Receiver<ServerRequest>,
@@ -98,6 +106,12 @@ async fn server_task(
                 let res = state_keeper
                     .switch_to_new_configuration(system_package_id, package_ids)
                     .await;
+                resp_tx
+                    .send(res)
+                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+            }
+            ServerRequest::GetSystemSummary { resp_tx } => {
+                let res = state_keeper.get_summary().await;
                 resp_tx
                     .send(res)
                     .map_err(|_| anyhow!("channel closed before we could send the response"))?;
@@ -162,5 +176,41 @@ async fn handle_new_configuration(
         }
     } else {
         Ok(HttpResponse::BadRequest().finish())
+    }
+}
+
+#[instrument(skip_all)]
+async fn retrieve_system_summary(
+    inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
+) -> actix_web::Result<impl Responder> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    inputs_sender
+        .send(ServerRequest::GetSystemSummary { resp_tx })
+        .await
+        .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+
+    match resp_rx
+        .await
+        .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Ok(summary) => {
+            let mut resp = json!({
+                "current_config": serde_json::to_value(summary.stable_configuration).unwrap(),
+                "status": summary.status.as_str(),
+            });
+
+            if let Some(extra_config) = summary.status.into_inner_configuration() {
+                resp.as_object_mut().unwrap().insert(
+                    "outstanding_config".to_string(),
+                    serde_json::to_value(extra_config).unwrap(),
+                );
+            }
+
+            Ok(Either::Left(web::Json(resp)))
+        }
+        Err(err) => Ok(Either::Right(
+            HttpResponse::Conflict().body(err.to_string()),
+        )),
     }
 }

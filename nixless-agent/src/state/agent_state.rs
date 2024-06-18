@@ -11,7 +11,13 @@ use crate::{
     system_configuration::SystemConfiguration,
 };
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SystemSummary {
+    pub stable_configuration: SystemConfiguration,
+    pub status: AgentStateStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum AgentStateStatus {
     New,
     Standby,
@@ -29,6 +35,17 @@ pub enum AgentStateStatus {
 }
 
 impl AgentStateStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Standby => "standby",
+            Self::FailedSwitch { .. } => "failed",
+            Self::DownloadingNewConfiguration { .. } => "downloading",
+            Self::SwitchingToConfiguration { .. } => "switching",
+            Self::Temporary => unreachable!("Temporary agent status shouldn't be reachable"),
+        }
+    }
+
     pub fn into_inner_configuration(self) -> Option<SystemConfiguration> {
         match self {
             Self::New | Self::Standby => None,
@@ -180,6 +197,7 @@ impl AgentState {
                                 .trim_start_matches("/")
                                 .to_string(),
                         )
+                        .package_ids(collect_nix_store_packages(&nix_store_dir).await?)
                         .build()?
                 } else {
                     build_tombstone_value(&nix_store_dir).await?
@@ -214,6 +232,16 @@ impl AgentState {
     pub fn set_standby(&mut self) -> anyhow::Result<()> {
         self.current_status = AgentStateStatus::Standby;
         self.save()
+    }
+
+    pub fn summary(&self) -> SystemSummary {
+        let stable_configuration = self.system_configurations.last().unwrap().clone();
+        let status = self.current_status.clone();
+
+        SystemSummary {
+            stable_configuration,
+            status,
+        }
     }
 
     pub fn new_configuration_system_package_path(&self) -> Option<PathBuf> {

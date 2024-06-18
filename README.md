@@ -10,7 +10,6 @@ At the moment, this is in pre-alpha stage, and is only tested inside NixOS VM te
 Major features missing:
 
 - Expose metrics that can be monitored from the outside of the host.
-- Endpoints to get basic info about the agent/system.
 
 Plenty of minor features are missing as well, but those are too much to be listed here right now.
 
