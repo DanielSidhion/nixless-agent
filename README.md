@@ -11,7 +11,11 @@ Major features missing:
 
 - Expose metrics that can be monitored from the outside of the host.
 
-Plenty of minor features are missing as well, but those are too much to be listed here right now.
+Minor features missing:
+
+- Graceful shutdown.
+- Listen on specific interfaces rather than 0.0.0.0.
+- Plenty of other minor features are missing as well, but those are too much to be listed here right now.
 
 Note: currently this work is not licensed.
 I want to get the code in a more robust state and finish some of the major features before licensing it.

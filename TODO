@@ -9,3 +9,4 @@
       }
     }
   });
+- Figure out why nix is rebuilding the NixOS test machines even when other somewhat unrelated stuff changed (e.g. the test script changes, then the machines are rebuilt).

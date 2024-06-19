@@ -39,9 +39,12 @@
             nil.packages.${system}.default
           ];
 
+          hardeningDisable = [ "fortify" ];
+
           env = {
             RUST_BACKTRACE = "full";
             RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           };
         };
       };
@@ -58,10 +61,13 @@
               lockFile = ./Cargo.lock;
             };
 
+            # TODO: Some incompatibility with libseccomp which is built by the `foundations` crate, should look into this to re-enable this setting in the future.
+            hardeningDisable = [ "fortify" ];
+
             # TODO: remove.
             buildType = "debug";
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
             buildInputs = [ pkgs.dbus.dev pkgs.systemdLibs.dev ];
 
             meta = {

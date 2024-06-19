@@ -1,6 +1,8 @@
 [package]
 name = "nixless-agent"
-version = "0.1.0"
+description = "A NixOS deployment agent for machines without Nix."
+authors = ["DS"]
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +17,7 @@ derive_builder = "0.20"
 dotenvy = "0.15"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 fastrand = "2"
+foundations = { version = "3.3.0", default_features = false, features = ["telemetry-server", "metrics", "memory-profiling", "security"] }
 futures = "0.3"
 narinfo = "1.0.1"
 nix = { version = "0.28", default_features = false, features = ["fs", "mount", "sched", "user"] }

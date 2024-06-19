@@ -1,9 +1,15 @@
-use std::path::PathBuf;
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use actors::{Deleter, Downloader, Server, StateKeeper, Unpacker};
 use anyhow::anyhow;
 use clap::Parser;
 use dbus_connection::DBusConnection;
+use foundations::telemetry::{
+    init_with_server,
+    settings::{
+        MemoryProfilerSettings, MetricsSettings, TelemetryServerSettings, TelemetrySettings,
+    },
+};
 use futures::StreamExt;
 use signal_hook::consts::signal;
 use signal_hook_tokio::Signals;
@@ -15,6 +21,7 @@ use crate::process_init::ensure_nix_daemon_not_present;
 mod actors;
 mod dbus_connection;
 mod fingerprint;
+mod metrics;
 mod owned_nar_info;
 mod path_utils;
 mod process_init;
@@ -27,6 +34,10 @@ struct Args {
     /// Port to listen on.
     #[arg(long, env = "NIXLESS_AGENT_LISTEN_PORT")]
     port: u16,
+
+    /// Port to listen on to serve metrics and other telemetry insights.
+    #[arg(long, env = "NIXLESS_AGENT_TELEMETRY_LISTEN_PORT")]
+    telemetry_port: u16,
 
     /// Path to the Nix store.
     #[arg(
@@ -108,9 +119,42 @@ async fn handle_signals(mut signals: Signals) {
     }
 }
 
+fn telemetry_server_settings(telemetry_port: u16) -> TelemetrySettings {
+    let mut metrics = MetricsSettings::default();
+    metrics.report_optional = true;
+
+    let mut memory_profiler = MemoryProfilerSettings::default();
+    memory_profiler.enabled = true;
+
+    TelemetrySettings {
+        metrics,
+        memory_profiler,
+        server: TelemetryServerSettings {
+            enabled: true,
+            addr: (Ipv4Addr::UNSPECIFIED, telemetry_port).into(),
+        },
+    }
+}
+
 #[tokio::main]
 async fn async_main(args: Args) -> anyhow::Result<()> {
     let store_path_string = args.nix_store_dir.canonicalize()?.to_str().ok_or_else(|| anyhow!("The nix store path given to us can't be represented as an UTF-8 string, but this is required!"))?.to_string();
+
+    let service_info = foundations::service_info!();
+    // TODO: configure graceful shutdown.
+    let telemetry_server = init_with_server(
+        &service_info,
+        &telemetry_server_settings(args.telemetry_port),
+        Vec::new(),
+    )?;
+
+    if let Some(addr) = telemetry_server.server_addr() {
+        tracing::info!(%addr, "Telemetry server has started.");
+    }
+
+    let telemetry_server_task = tokio::spawn(async move {
+        telemetry_server.await.unwrap();
+    });
 
     let signals = Signals::new(&[
         signal::SIGHUP,

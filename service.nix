@@ -41,6 +41,13 @@ in
         type = lib.types.port;
         default = 45567;
       };
+      telemetryPort = lib.mkOption {
+        description = ''
+          The port on which nixless-agent will listen for telemetry requests.
+        '';
+        type = lib.types.port;
+        default = 56678;
+      };
       cacheUrl = lib.mkOption {
         description = ''
           The URL of the binary cache to use when downloading a system configuration.
@@ -103,6 +110,7 @@ in
 
         environment = {
           NIXLESS_AGENT_LISTEN_PORT = builtins.toString cfg.port;
+          NIXLESS_AGENT_TELEMETRY_LISTEN_PORT = builtins.toString cfg.telemetryPort;
           NIXLESS_AGENT_TEMP_DOWNLOAD_PATH = "/var/lib/nixless-agent/downloads";
           NIXLESS_AGENT_CACHE_URL = cfg.cacheUrl;
           NIXLESS_AGENT_ABSOLUTE_ACTIVATION_TRACKER_COMMAND = lib.getExe system-switch-tracker;

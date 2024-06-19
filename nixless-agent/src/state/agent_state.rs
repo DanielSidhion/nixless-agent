@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    metrics,
     path_utils::{
         collect_nix_store_packages, get_number_from_numbered_system_name,
         overwrite_symlink_atomically_with_check,
@@ -140,7 +141,7 @@ impl AgentState {
     ) -> anyhow::Result<Self> {
         let state_file_path = Self::absolute_state_path_associated(&nixless_state_dir);
 
-        if !state_file_path.exists() {
+        let res = if !state_file_path.exists() {
             Self::new(
                 nix_store_dir,
                 nix_state_base_dir,
@@ -159,7 +160,13 @@ impl AgentState {
             state.state_file_path = state_file_path;
             state.max_system_history_count = max_system_history_count;
             Ok(state)
+        };
+
+        if let Ok(state) = &res {
+            metrics::system::version().set(state.latest_configuration_version() as u64);
         }
+
+        res
     }
 
     /// Tries to determine the current configuration by inspecting the current system path, which is usually at `/run/current-system`.
@@ -336,6 +343,9 @@ impl AgentState {
             self.system_configurations
                 .push(previous_status.into_inner_configuration().unwrap());
             self.save()?;
+
+            metrics::system::version().set(self.latest_configuration_version() as u64);
+
             // Will take care of fixing the links to the system profile for us.
             self.repair_profile_links().await?;
 
