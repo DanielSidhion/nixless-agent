@@ -95,17 +95,21 @@ in
       test_machine.start(True)
       test_machine.wait_for_unit("nixless-agent.service")
 
-      binary_cache.wait_until_succeeds("curl http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
-      binary_cache.succeed("curl http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 0'")
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 0'")
 
       binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${newTestMachineRequest} http://test_machine:56321/new-configuration")
       test_machine.wait_for_file("/etc/new-test-machine-tracker", 20000)
       file_contents = test_machine.succeed("cat /etc/new-test-machine-tracker")
-
-      binary_cache.wait_until_succeeds("curl http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\" and .current_config.system_package_id == \"${getSystemPackageId newTestMachine}\"'", 20000)
-      binary_cache.succeed("curl http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 1'")
-
       assert file_contents == "${newFileContents}"
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\" and .current_config.system_package_id == \"${getSystemPackageId newTestMachine}\"'", 20000)
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 1' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_requests_summary [[:digit:]]\+' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_requests_new_configuration 1' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_configuration_download_duration_count{system_package_id=\"${getSystemPackageId newTestMachine}\"} 1' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_configuration_setup_duration_count{system_package_id=\"${getSystemPackageId newTestMachine}\"} 1' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_configuration_switch_duration_count{system_package_id=\"${getSystemPackageId newTestMachine}\"} 1' -")
     '';
   };
 
@@ -127,12 +131,12 @@ in
       test_machine.start(True)
       test_machine.wait_for_unit("nixless-agent.service")
 
-      binary_cache.wait_until_succeeds("curl http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
 
       binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${newTestMachineRequest} http://test_machine:56321/new-configuration")
       test_machine.wait_for_file("/etc/new-test-machine-tracker", 20000)
 
-      binary_cache.wait_until_succeeds("curl http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
 
       binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${secondNewTestMachineRequest} http://test_machine:56321/new-configuration")
       test_machine.wait_for_file("/etc/second-new-test-machine-tracker", 20000)
@@ -140,8 +144,8 @@ in
       file_contents = test_machine.succeed("cat /etc/second-new-test-machine-tracker")
       assert file_contents == "${secondNewFileContents}"
 
-      binary_cache.wait_until_succeeds("curl http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\" and .current_config.system_package_id == \"${getSystemPackageId secondNewTestMachine}\"'", 20000)
-      binary_cache.succeed("curl http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 2'")
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\" and .current_config.system_package_id == \"${getSystemPackageId secondNewTestMachine}\"'", 20000)
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 2' -")
 
       # Should've been cleaned up.
       test_machine.fail("ls -l /etc/new-test-machine-tracker")

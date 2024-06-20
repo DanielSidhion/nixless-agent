@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::anyhow;
 use derive_builder::Builder;
@@ -11,9 +11,11 @@ use tracing::instrument;
 
 use crate::{
     dbus_connection::StartedDBusConnection,
+    metrics,
     path_utils::clean_up_nix_var_dir,
     state::{
-        check_switching_status, AgentState, AgentStateStatus, SystemSummary, SystemSwitchStatus,
+        calculate_switch_duration, check_switching_status, record_switch_start, AgentState,
+        AgentStateStatus, SystemSummary, SystemSwitchStatus,
     },
 };
 
@@ -226,17 +228,21 @@ async fn state_keeper_task(
                         resp_tx.send(Err(anyhow!("The system is already switching to a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                     }
                     AgentStateStatus::Standby => {
+                        let system_package_id_arc = Arc::new(system_package_id.clone());
                         state.mark_switching_new_system(system_package_id, package_ids.clone())?;
 
                         let input_tx_clone = input_tx.clone();
                         let downloader_child = downloader.child();
                         let unpacker_child = unpacker.child();
                         let dbus_connection_child = dbus_connection.child();
+                        // A bit annoying that we have to grab this from agent state, but seems like the better option. There are other ways to structure the code here to allow moving this stuff all inside the agent state so we don't need to clone the agent state or make an Arc or whatever, but I think this is fine for now.
+                        let switch_start_file_path = state.absolute_switch_start_time_path();
                         let new_configuration_path = state.new_configuration_system_package_path().unwrap(); // We just marked that we're switching to a new system, so the `unwrap()` should never fail.
                         // We send the response just before starting the task just to try to avoid as much as possible any issues with never sending a response back if the system switch is almost immediate (e.g. everything already downloaded).
                         // TODO: guarantee that we'll wait until a response is sent back all the way through the server before we proceed with system switch?
                         resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                         pending_system_switch_task = Some(tokio::spawn(async move {
+                            let download_timer = metrics::system::configuration_download_duration(&system_package_id_arc).start_timer();
                             let res = match downloader_child.download_packages(package_ids).await {
                                 Ok(v) => v,
                                 Err(err) => {
@@ -245,7 +251,10 @@ async fn state_keeper_task(
                                     return;
                                 },
                             };
+                            let download_duration = download_timer.stop_and_record();
+                            tracing::info!(download_duration_secs = download_duration.as_secs_f32(), "Finished downloading new system configuration.");
 
+                            let setup_timer = metrics::system::configuration_setup_duration(&system_package_id_arc).start_timer();
                             match unpacker_child.unpack_downloads(res).await {
                                 Ok(()) => (),
                                 Err(err) => {
@@ -254,7 +263,10 @@ async fn state_keeper_task(
                                     return;
                                 }
                             };
+                            let setup_duration = setup_timer.stop_and_record();
+                            tracing::info!(setup_duration_secs = setup_duration.as_secs_f32(), "Finished unpacking new system configuration.");
 
+                            record_switch_start(switch_start_file_path.clone()).unwrap();
                             match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
                                 Ok(()) => (),
                                 Err(err) => {
@@ -271,14 +283,36 @@ async fn state_keeper_task(
                 }
             }
             StateKeeperRequest::ConfigurationSwitchResult(Err(err)) => {
-                tracing::error!(?err, "We failed to perform a system switch!");
                 pending_system_switch_task = None;
+
+                let switch_duration =
+                    calculate_switch_duration(state.absolute_switch_start_time_path()).unwrap();
+                metrics::system::configuration_switch_duration(&Arc::new(
+                    state.latest_package_id(),
+                ))
+                .observe(switch_duration.as_nanos().try_into().unwrap());
+                tracing::info!(
+                    switch_duration_secs = switch_duration.as_secs_f32(),
+                    ?err,
+                    "Failed to switch to new system configuration."
+                );
             }
             StateKeeperRequest::ConfigurationSwitchResult(Ok(())) => {
                 tracing::info!("Configuration switch was successful!");
                 wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
                 pending_system_switch_task = None;
                 tracing::info!("State updated!");
+
+                let switch_duration =
+                    calculate_switch_duration(state.absolute_switch_start_time_path()).unwrap();
+                metrics::system::configuration_switch_duration(&Arc::new(
+                    state.latest_package_id(),
+                ))
+                .observe(switch_duration.as_nanos().try_into().unwrap());
+                tracing::info!(
+                    switch_duration_secs = switch_duration.as_secs_f32(),
+                    "Finished switching to new system configuration."
+                );
 
                 input_tx
                     .send(StateKeeperRequest::CleanupConfigurationHistory)

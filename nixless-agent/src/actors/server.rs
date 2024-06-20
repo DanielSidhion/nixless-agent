@@ -15,7 +15,7 @@ use tokio::{
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::instrument;
 
-use crate::state::SystemSummary;
+use crate::{metrics, state::SystemSummary};
 
 use super::StartedStateKeeper;
 
@@ -129,6 +129,8 @@ async fn handle_new_configuration(
     inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
     keychain: web::Data<PublicKeychain>,
 ) -> actix_web::Result<impl Responder> {
+    metrics::requests::new_configuration().inc();
+
     let mut lines = payload_string.lines();
 
     if let Some(system_package_id) = lines.next() {
@@ -183,6 +185,8 @@ async fn handle_new_configuration(
 async fn retrieve_system_summary(
     inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
 ) -> actix_web::Result<impl Responder> {
+    metrics::requests::summary().inc();
+
     let (resp_tx, resp_rx) = oneshot::channel();
 
     inputs_sender

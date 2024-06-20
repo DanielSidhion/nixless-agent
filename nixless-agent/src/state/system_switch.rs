@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::anyhow;
 
@@ -16,6 +21,7 @@ pub struct SwitchStatusCodes {
     pub exit_status: String,
 }
 
+// TODO: perhaps move this inside agent_state.
 /// Will also clean up the tracking files if they exist.
 pub async fn check_switching_status(directory: &PathBuf) -> anyhow::Result<SystemSwitchStatus> {
     let started_path = directory.join("pre_switch");
@@ -78,4 +84,35 @@ async fn clean_up_system_switch_tracking_files(directory: &PathBuf) -> anyhow::R
     r3?;
 
     Ok(())
+}
+
+pub fn record_switch_start(file_path: PathBuf) -> anyhow::Result<()> {
+    let mut file = File::options()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(file_path)?;
+
+    let now = SystemTime::now();
+    serde_json::to_writer(&mut file, &now)?;
+    file.flush()?;
+    file.sync_all()?;
+
+    Ok(())
+}
+
+/// Will also clean up the tracking file if it exists.
+pub fn calculate_switch_duration(file_path: PathBuf) -> anyhow::Result<Duration> {
+    if !file_path.exists() {
+        return Err(anyhow!("there is no file with the time the switch started"));
+    }
+
+    let now = SystemTime::now();
+
+    let start_time = std::fs::read_to_string(&file_path)?;
+    let start_time: SystemTime = serde_json::from_str(&start_time)?;
+
+    let duration = now.duration_since(start_time)?;
+    std::fs::remove_file(file_path)?;
+    Ok(duration)
 }

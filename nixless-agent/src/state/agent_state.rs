@@ -1,4 +1,6 @@
-use std::{collections::HashSet, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashSet, fs::File, io::Write, path::PathBuf, str::FromStr, time::SystemTime,
+};
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -112,6 +114,10 @@ impl AgentState {
 
     pub fn absolute_state_path(&self) -> PathBuf {
         self.nixless_state_dir.join(Self::relative_state_path())
+    }
+
+    pub fn absolute_switch_start_time_path(&self) -> PathBuf {
+        self.nixless_state_dir.join("switch_start")
     }
 
     /// This ends with `_associated` just because we have a method with the same name, so the `_associated` disambiguates to show that this is an associated function rather than a method.
@@ -266,6 +272,13 @@ impl AgentState {
         self.system_configurations
             .last()
             .map(|c| c.version_number)
+            .unwrap()
+    }
+
+    pub fn latest_package_id(&self) -> String {
+        self.system_configurations
+            .last()
+            .map(|c| c.system_package_id.clone())
             .unwrap()
     }
 

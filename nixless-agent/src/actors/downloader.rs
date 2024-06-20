@@ -19,7 +19,8 @@ use tracing::instrument;
 use xz_decoder::XZDecoder;
 
 use crate::{
-    fingerprint::Fingerprint, owned_nar_info::OwnedNarInfo, path_utils::collect_nix_store_packages,
+    fingerprint::Fingerprint, metrics, owned_nar_info::OwnedNarInfo,
+    path_utils::collect_nix_store_packages,
 };
 
 #[derive(Builder)]
