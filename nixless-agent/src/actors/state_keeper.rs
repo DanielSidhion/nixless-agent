@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use anyhow::anyhow;
 use derive_builder::Builder;
@@ -64,12 +64,13 @@ impl StateKeeper {
         });
 
         StartedStateKeeper {
-            task: Some(task),
-            input_tx,
+            task,
+            input: StartedStateKeeperInput { input_tx },
         }
     }
 }
 
+// TODO: add a message to sweep the nix store dir and check for any foreign packages.
 enum StateKeeperRequest {
     CleanUpStateDir,
     CleanUpStateDirResult(anyhow::Result<()>),
@@ -84,22 +85,38 @@ enum StateKeeperRequest {
     GetSummary {
         resp_tx: oneshot::Sender<anyhow::Result<SystemSummary>>,
     },
-    // TODO: add a message to sweep the nix store dir and check for any foreign packages.
+    PerformRollback {
+        to_version: Option<u32>,
+        resp_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
+#[derive(Debug)]
 pub struct StartedStateKeeper {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    input_tx: mpsc::Sender<StateKeeperRequest>,
+    task: JoinHandle<anyhow::Result<()>>,
+    input: StartedStateKeeperInput,
+}
+
+impl Deref for StartedStateKeeper {
+    type Target = StartedStateKeeperInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
 }
 
 impl StartedStateKeeper {
-    pub fn child(&self) -> Self {
-        Self {
-            task: None,
-            input_tx: self.input_tx.clone(),
-        }
+    pub fn input(&self) -> StartedStateKeeperInput {
+        self.input.clone()
     }
+}
 
+#[derive(Clone, Debug)]
+pub struct StartedStateKeeperInput {
+    input_tx: mpsc::Sender<StateKeeperRequest>,
+}
+
+impl StartedStateKeeperInput {
     pub async fn switch_to_new_configuration(
         &self,
         system_package_id: String,
@@ -123,6 +140,19 @@ impl StartedStateKeeper {
 
         self.input_tx
             .send(StateKeeperRequest::GetSummary { resp_tx })
+            .await?;
+
+        resp_rx.await?
+    }
+
+    pub async fn perform_rollback(&self, to_version: Option<u32>) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.input_tx
+            .send(StateKeeperRequest::PerformRollback {
+                to_version,
+                resp_tx,
+            })
             .await?;
 
         resp_rx.await?
@@ -205,6 +235,51 @@ async fn state_keeper_task(
             StateKeeperRequest::CleanUpStateDirResult(Ok(())) => {
                 tracing::info!("Task to clean up the Nix state dir succeeded!");
                 pending_clean_up_task = None;
+            }
+            StateKeeperRequest::PerformRollback {
+                to_version,
+                resp_tx,
+            } => {
+                tracing::info!(
+                    ?to_version,
+                    "State keeper got a request to rollback configuration."
+                );
+
+                match state.status() {
+                    AgentStateStatus::New | AgentStateStatus::Temporary => unreachable!("should have never been in a new or temporary state during the state keeper main loop"),
+                    AgentStateStatus::DownloadingNewConfiguration { .. } => {
+                        resp_tx.send(Err(anyhow!("The system is already downloading a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    AgentStateStatus::SwitchingToConfiguration { .. } => {
+                        resp_tx.send(Err(anyhow!("The system is already switching to a new system configuration."))).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    }
+                    AgentStateStatus::FailedSwitch { .. } | AgentStateStatus::Standby => {
+                        state.mark_performing_rollback(to_version).await?;
+
+                        let input_tx_clone = input_tx.clone();
+                        let dbus_connection_child = dbus_connection.child();
+                        // A bit annoying that we have to grab this from agent state, but seems like the better option. There are other ways to structure the code here to allow moving this stuff all inside the agent state so we don't need to clone the agent state or make an Arc or whatever, but I think this is fine for now.
+                        let switch_start_file_path = state.absolute_switch_start_time_path();
+                        let new_configuration_path = state.new_configuration_system_package_path().unwrap(); // We just marked that we're switching to a new system, so the `unwrap()` should never fail.
+                        // We send the response just before starting the task just to try to avoid as much as possible any issues with never sending a response back if the system switch is almost immediate.
+                        // TODO: guarantee that we'll wait until a response is sent back all the way through the server before we proceed with system switch?
+                        resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                        pending_system_switch_task = Some(tokio::spawn(async move {
+                            record_switch_start(switch_start_file_path.clone()).unwrap();
+                            match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
+                                Ok(()) => (),
+                                Err(err) => {
+                                    tracing::error!(?err, "Got an error when performing a system switch for a rollback.");
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    return;
+                                }
+                            }
+
+                            // We'll check if system switch was made successfully inside the state keeper code instead of this ad-hoc task.
+                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Ok(()))).await.unwrap();
+                        }));
+                    }
+                }
             }
             StateKeeperRequest::SwitchToNewConfiguration {
                 system_package_id,

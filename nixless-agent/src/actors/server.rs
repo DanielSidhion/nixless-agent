@@ -4,26 +4,21 @@ use actix_web::{
     error::InternalError, http::StatusCode, web, App, Either, HttpRequest, HttpResponse,
     HttpServer, Responder,
 };
-use anyhow::anyhow;
 use derive_builder::Builder;
 use nix_core::{NixStylePublicKey, PublicKeychain};
 use serde_json::json;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio::task::JoinHandle;
 use tracing::instrument;
 
-use crate::{metrics, state::SystemSummary};
+use crate::metrics;
 
-use super::StartedStateKeeper;
+use super::StartedStateKeeperInput;
 
 #[derive(Builder)]
 #[builder(pattern = "owned")]
 pub struct Server {
     port: u16,
-    state_keeper: StartedStateKeeper,
+    state_keeper_input: StartedStateKeeperInput,
     update_public_key: String,
 }
 
@@ -37,20 +32,19 @@ impl Server {
         let public_key = NixStylePublicKey::from_nix_format(&self.update_public_key)?;
         keychain.add_key(public_key)?;
 
-        let (input_tx, input_rx) = mpsc::channel(10);
-
-        let inputs_task = tokio::spawn(server_task(input_rx, self.state_keeper));
-
-        let inputs_sender = web::Data::new(input_tx.clone());
         let keychain = web::Data::new(keychain);
         let server_task = HttpServer::new(move || {
             App::new()
-                .app_data(inputs_sender.clone())
+                .app_data(web::Data::new(self.state_keeper_input.clone()))
                 .app_data(keychain.clone())
                 .route("/summary", web::get().to(retrieve_system_summary))
                 .route(
                     "/new-configuration",
                     web::post().to(handle_new_configuration),
+                )
+                .route(
+                    "/rollback-configuration",
+                    web::post().to(rollback_configuration),
                 )
                 .route("/", web::to(HttpResponse::ImATeapot))
         })
@@ -62,71 +56,20 @@ impl Server {
         let server_task = tokio::spawn(async { server_task.await });
 
         Ok(StartedServer {
-            inputs_task: Some(inputs_task),
             server_task: Some(server_task),
-            input_tx,
         })
     }
 }
 
 pub struct StartedServer {
-    inputs_task: Option<JoinHandle<anyhow::Result<()>>>,
     server_task: Option<JoinHandle<std::io::Result<()>>>,
-    input_tx: mpsc::Sender<ServerRequest>,
-}
-
-pub enum ServerRequest {
-    UpdateSystem {
-        system_package_id: String,
-        package_ids: HashSet<String>,
-        resp_tx: oneshot::Sender<anyhow::Result<()>>,
-    },
-    GetSystemSummary {
-        resp_tx: oneshot::Sender<anyhow::Result<SystemSummary>>,
-    },
-}
-
-// TODO: this is acting as a buffer task right now - think better whether it makes sense to just expose the `state_keeper` inside each handler of the server instead.
-#[instrument(skip_all)]
-async fn server_task(
-    input_rx: mpsc::Receiver<ServerRequest>,
-    state_keeper: StartedStateKeeper,
-) -> anyhow::Result<()> {
-    let mut input_stream = ReceiverStream::new(input_rx);
-
-    tracing::info!("Server will now enter its main loop.");
-
-    while let Some(req) = input_stream.next().await {
-        match req {
-            ServerRequest::UpdateSystem {
-                system_package_id,
-                package_ids,
-                resp_tx,
-            } => {
-                let res = state_keeper
-                    .switch_to_new_configuration(system_package_id, package_ids)
-                    .await;
-                resp_tx
-                    .send(res)
-                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
-            }
-            ServerRequest::GetSystemSummary { resp_tx } => {
-                let res = state_keeper.get_summary().await;
-                resp_tx
-                    .send(res)
-                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[instrument(skip_all, fields(uri = req.uri().to_string(), method = req.method().as_str()))]
 async fn handle_new_configuration(
     req: HttpRequest,
     payload_string: String,
-    inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
+    state_keeper: web::Data<StartedStateKeeperInput>,
     keychain: web::Data<PublicKeychain>,
 ) -> actix_web::Result<impl Responder> {
     metrics::requests::new_configuration().inc();
@@ -156,22 +99,11 @@ async fn handle_new_configuration(
             return Ok(HttpResponse::BadRequest().finish());
         }
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-
         tracing::info!("Sending server request to update the system.");
 
-        inputs_sender
-            .send(ServerRequest::UpdateSystem {
-                system_package_id: system_package_id.to_string(),
-                package_ids,
-                resp_tx,
-            })
+        match state_keeper
+            .switch_to_new_configuration(system_package_id.to_string(), package_ids)
             .await
-            .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
-
-        match resp_rx
-            .await
-            .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
         {
             Ok(()) => Ok(HttpResponse::NoContent().finish()),
             Err(err) => Ok(HttpResponse::Conflict().body(err.to_string())),
@@ -183,21 +115,11 @@ async fn handle_new_configuration(
 
 #[instrument(skip_all)]
 async fn retrieve_system_summary(
-    inputs_sender: web::Data<mpsc::Sender<ServerRequest>>,
+    state_keeper: web::Data<StartedStateKeeperInput>,
 ) -> actix_web::Result<impl Responder> {
     metrics::requests::summary().inc();
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-
-    inputs_sender
-        .send(ServerRequest::GetSystemSummary { resp_tx })
-        .await
-        .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
-
-    match resp_rx
-        .await
-        .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
-    {
+    match state_keeper.get_summary().await {
         Ok(summary) => {
             let mut resp = json!({
                 "current_config": serde_json::to_value(summary.stable_configuration).unwrap(),
@@ -216,5 +138,28 @@ async fn retrieve_system_summary(
         Err(err) => Ok(Either::Right(
             HttpResponse::Conflict().body(err.to_string()),
         )),
+    }
+}
+
+#[instrument(skip_all)]
+async fn rollback_configuration(
+    payload_string: String,
+    state_keeper: web::Data<StartedStateKeeperInput>,
+) -> actix_web::Result<impl Responder> {
+    metrics::requests::rollback().inc();
+
+    let version_to_rollback: Option<u32> = if payload_string.is_empty() {
+        None
+    } else {
+        Some(
+            payload_string
+                .parse()
+                .map_err(|err| InternalError::new(err, StatusCode::INTERNAL_SERVER_ERROR))?,
+        )
+    };
+
+    match state_keeper.perform_rollback(version_to_rollback).await {
+        Ok(()) => Ok(HttpResponse::NoContent().finish()),
+        Err(err) => Ok(HttpResponse::Conflict().body(err.to_string())),
     }
 }

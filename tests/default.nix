@@ -48,7 +48,7 @@ let
       (import ./binary_cache_machine.nix { inherit nixServeNgModule testPrivateKey; })
     ];
 
-    virtualisation.additionalPaths = [ "${pkgs.jq}" "${newTestMachineRequest}" "${secondNewTestMachineRequest}" ];
+    virtualisation.additionalPaths = [ "${pkgs.jq}" "${newTestMachineRequest}" "${secondNewTestMachineRequest}" "${thirdNewTestMachineRequest}" ];
   };
 
   testMachineNode = import ./test_machine.nix { inherit nixless-agent-module testPublicKey; };
@@ -75,6 +75,17 @@ let
     ];
   };
   secondNewTestMachineRequest = generateSystemConfigRequestFile secondNewTestMachine;
+
+  thirdNewFileContents = "This proves the machine got updated to the third new configuration.";
+  thirdNewTestMachine = evalTestMachine {
+    imports = [
+      testMachineNode
+      ({
+        environment.etc.third-new-test-machine-tracker.text = thirdNewFileContents;
+      })
+    ];
+  };
+  thirdNewTestMachineRequest = generateSystemConfigRequestFile thirdNewTestMachine;
 in
 {
   normal = nixosLib.runTest {
@@ -149,6 +160,48 @@ in
 
       # Should've been cleaned up.
       test_machine.fail("ls -l /etc/new-test-machine-tracker")
+    '';
+  };
+
+  rollbackFromStandbyToLatest = nixosLib.runTest {
+    name = "rollback-from-standby-to-latest";
+    hostPkgs = pkgs;
+    globalTimeout = 120;
+
+    nodes = {
+      binary_cache = binaryCacheNode;
+      test_machine = testMachineNode;
+    };
+
+    includeTestScriptReferences = false; # If this is left at the default of `true`, the test machine will end up with a local copy of the new configuration already, because it uses its own Nix store and the testing infrastructure will put the closure of the test script inside that Nix store.
+    testScript = ''
+      binary_cache.start()
+      binary_cache.wait_for_unit("nix-serve.service")
+
+      test_machine.start(True)
+      test_machine.wait_for_unit("nixless-agent.service")
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+
+      binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${newTestMachineRequest} http://test_machine:56321/new-configuration")
+      test_machine.wait_for_file("/etc/new-test-machine-tracker", 20000)
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+
+      binary_cache.succeed("curl -i --fail-with-body -X POST --data-binary @${thirdNewTestMachineRequest} http://test_machine:56321/new-configuration")
+      test_machine.wait_for_file("/etc/third-new-test-machine-tracker", 20000)
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+
+      binary_cache.succeed("curl -i --fail-with-body -X POST http://test_machine:56321/rollback-configuration")
+      test_machine.wait_for_file("/etc/new-test-machine-tracker", 20000)
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\" and .current_config.system_package_id == \"${getSystemPackageId newTestMachine}\"'", 20000)
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 3' -")
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_requests_rollback 1' -")
+
+      # Should've been cleaned up.
+      test_machine.fail("ls -l /etc/third-new-test-machine-tracker")
     '';
   };
 }

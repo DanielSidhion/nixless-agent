@@ -29,6 +29,7 @@
             rust-analyzer
             rustfmt
             just
+            clang
 
             dbus.dev
             systemdLibs.dev

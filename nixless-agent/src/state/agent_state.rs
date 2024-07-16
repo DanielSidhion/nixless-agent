@@ -353,6 +353,7 @@ impl AgentState {
         if let AgentStateStatus::SwitchingToConfiguration { .. } = &self.current_status {
             let previous_status =
                 std::mem::replace(&mut self.current_status, AgentStateStatus::Standby);
+            // TODO: if the configuration that we switched to is the same as the latest configuration in `self.system_configurations` (this can happen in case of a rollback after a failed switch), should we just change the version number of the config that exists in `self.system_configurations` instead of adding another entry there?
             self.system_configurations
                 .push(previous_status.into_inner_configuration().unwrap());
             self.save()?;
@@ -381,6 +382,64 @@ impl AgentState {
         } else {
             Err(anyhow!("we're not switching to a new system at the moment"))
         }
+    }
+
+    pub async fn mark_performing_rollback(
+        &mut self,
+        to_version: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            self.current_status,
+            AgentStateStatus::Standby | AgentStateStatus::FailedSwitch { .. }
+        ) {
+            return Err(anyhow!(
+                "can only rollback if a configuration switch failed or the agent is on standby"
+            ));
+        }
+
+        // Make sure the version we're rolling back to is still in our state.
+        let new_config = if let Some(version) = to_version {
+            self.system_configurations
+                .iter()
+                .find(|c| c.version_number == version)
+                .ok_or_else(|| {
+                    anyhow!("the given version to rollback to isn't in the agent's state anymore")
+                })?
+        } else {
+            if let AgentStateStatus::FailedSwitch { .. } = &self.current_status {
+                self.system_configurations.last().unwrap()
+            } else {
+                self.system_configurations
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .next()
+                    .ok_or_else(|| anyhow!("not enough versions to rollback to"))?
+            }
+        };
+
+        if new_config.is_tombstone() {
+            return Err(anyhow!(
+                "can't rollback to a configuration that wasn't managed by the agent"
+            ));
+        }
+
+        let mut new_config = new_config.clone();
+        new_config.version_number = self.latest_configuration_version() + 1;
+
+        let previous_status =
+            std::mem::replace(&mut self.current_status, AgentStateStatus::Temporary);
+
+        if let AgentStateStatus::FailedSwitch { configuration } = previous_status {
+            // We'll get rid of the failed configuration, which means its packages have to be cleaned up.
+            self.mark_configs_for_removal(vec![configuration]);
+        }
+
+        self.current_status = AgentStateStatus::SwitchingToConfiguration {
+            configuration: new_config,
+        };
+
+        self.save()
     }
 
     pub fn mark_switching_new_system(
@@ -483,9 +542,16 @@ impl AgentState {
             "Removed some configs from the history, will group packages now."
         );
 
-        // Idea is to add all packages from the removed configurations to a set, and then go over all the configurations we're still tracking in the state and remove all packages in those from the set - this should give us a set with all packages that were ONLY in the configurations that we removed.
+        self.mark_configs_for_removal(removed_configs);
+        self.repair_profile_links().await?;
+        Ok(())
+    }
+
+    // Idea is to add all packages from the removed configurations to a set, and then go over all the configurations we're still tracking in the state and remove all packages in those from the set - this should give us a set with all packages that were ONLY in the configurations that we removed.
+    fn mark_configs_for_removal(&mut self, configs_to_remove: Vec<SystemConfiguration>) {
         let mut packages_from_removed_configs = HashSet::new();
-        for config in removed_configs {
+
+        for config in configs_to_remove {
             tracing::info!(config.system_package_id, "Adding packages to be removed");
             packages_from_removed_configs.insert(config.system_package_id);
             packages_from_removed_configs.extend(config.package_ids.into_iter());
@@ -502,9 +568,6 @@ impl AgentState {
 
         self.packages_to_cleanup
             .extend(packages_from_removed_configs.into_iter());
-
-        self.repair_profile_links().await?;
-        Ok(())
     }
 
     pub fn has_packages_to_cleanup(&self) -> bool {

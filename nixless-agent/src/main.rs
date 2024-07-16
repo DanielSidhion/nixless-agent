@@ -209,7 +209,7 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
 
     let server = Server::builder()
         .port(args.port)
-        .state_keeper(state_keeper.child())
+        .state_keeper_input(state_keeper.input())
         .update_public_key(args.update_public_key)
         .build()?
         .start()?;

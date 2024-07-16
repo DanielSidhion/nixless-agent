@@ -32,4 +32,7 @@ pub mod requests {
 
     /// Number of new configuration requests made to the agent since it started up.
     pub fn new_configuration() -> Counter;
+
+    /// Number of rollback requests made to the agent since it started up.
+    pub fn rollback() -> Counter;
 }
