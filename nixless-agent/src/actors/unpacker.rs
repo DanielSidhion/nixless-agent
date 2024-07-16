@@ -1,6 +1,7 @@
 use std::{
     fs::{read_dir, File},
     iter::repeat_with,
+    ops::Deref,
     os::unix::fs::lchown,
     path::PathBuf,
     time::SystemTime,
@@ -32,29 +33,40 @@ pub enum UnpackerRequest {
         downloads: Vec<NarDownloadResult>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    Shutdown,
 }
 
+#[derive(Debug)]
 pub struct StartedUnpacker {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    input_tx: mpsc::Sender<UnpackerRequest>,
+    task: JoinHandle<anyhow::Result<()>>,
+    input: StartedUnpackerInput,
 }
 
 impl StartedUnpacker {
-    pub fn child(&self) -> Self {
-        Self {
-            task: None,
-            input_tx: self.input_tx.clone(),
-        }
+    pub fn input(&self) -> StartedUnpackerInput {
+        self.input.clone()
     }
 
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        if let Some(task) = self.task {
-            task.await??;
-        }
-
-        Ok(())
+        self.input.input_tx.send(UnpackerRequest::Shutdown).await?;
+        self.task.await?
     }
+}
 
+impl Deref for StartedUnpacker {
+    type Target = StartedUnpackerInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StartedUnpackerInput {
+    input_tx: mpsc::Sender<UnpackerRequest>,
+}
+
+impl StartedUnpackerInput {
     pub async fn unpack_downloads(&self, downloads: Vec<NarDownloadResult>) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -77,8 +89,8 @@ impl Unpacker {
         let task = tokio::spawn(unpacker_task(self.nix_store_dir, input_rx));
 
         StartedUnpacker {
-            task: Some(task),
-            input_tx,
+            task,
+            input: StartedUnpackerInput { input_tx },
         }
     }
 }
@@ -94,6 +106,10 @@ async fn unpacker_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
+            UnpackerRequest::Shutdown => {
+                tracing::info!("Unpacker got a request to shutdown. Shutting down.");
+                break;
+            }
             UnpackerRequest::UnpackDownloads { downloads, resp_tx } => {
                 // TODO: this currently runs on a single thread. Moving it to multiple threads (but still bounded by some limit) is not too trivial and will require a bit of thought.
                 let nix_store_dir_clone = nix_store_dir.clone();

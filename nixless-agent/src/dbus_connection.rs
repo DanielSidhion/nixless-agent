@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context};
 use dbus::{
@@ -51,33 +51,46 @@ impl DBusConnection {
         });
 
         StartedDBusConnection {
-            input_tx,
-            task: Some(task),
+            task,
+            input: StartedDBusConnectionInput { input_tx },
         }
     }
 }
 
+#[derive(Debug)]
 pub struct StartedDBusConnection {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    pub input_tx: mpsc::Sender<DBusConnectionRequest>,
+    task: JoinHandle<anyhow::Result<()>>,
+    input: StartedDBusConnectionInput,
 }
 
 impl StartedDBusConnection {
-    pub fn child(&self) -> Self {
-        Self {
-            task: None,
-            input_tx: self.input_tx.clone(),
-        }
+    pub fn input(&self) -> StartedDBusConnectionInput {
+        self.input.clone()
     }
 
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        if let Some(task) = self.task {
-            task.await??;
-        }
-
-        Ok(())
+        self.input
+            .input_tx
+            .send(DBusConnectionRequest::Shutdown)
+            .await?;
+        self.task.await?
     }
+}
 
+impl Deref for StartedDBusConnection {
+    type Target = StartedDBusConnectionInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StartedDBusConnectionInput {
+    input_tx: mpsc::Sender<DBusConnectionRequest>,
+}
+
+impl StartedDBusConnectionInput {
     pub async fn check_authorisation_possibility(&self) -> anyhow::Result<bool> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -123,6 +136,7 @@ pub enum DBusConnectionRequest {
     WaitConfigurationSwitchComplete {
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    Shutdown,
 }
 
 async fn dbus_connection_task(
@@ -147,6 +161,10 @@ async fn dbus_connection_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
+            DBusConnectionRequest::Shutdown => {
+                tracing::info!("D-Bus connection got a request to shut down. Shutting down.");
+                break;
+            }
             DBusConnectionRequest::CheckAuthorisationPossibility { resp_tx } => {
                 let res = check_polkit_authorised(conn.clone()).await;
                 resp_tx

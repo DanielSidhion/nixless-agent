@@ -20,7 +20,7 @@ fastrand = "2"
 foundations = { version = "3.3.0", default_features = false, features = ["telemetry-server", "metrics", "memory-profiling", "security"] }
 futures = "0.3"
 narinfo = "1.0.1"
-nix = { version = "0.28", default_features = false, features = ["fs", "mount", "sched", "user"] }
+nix = { version = "0.28", default_features = false, features = ["fs", "mount", "net", "sched", "user"] }
 nix-core = { path = "../nix-core" }
 nix-nar = "0.3.0"
 reqwest = { version = "0.12", default_features = false, features = ["http2", "charset", "rustls-tls", "stream"] }

@@ -14,9 +14,9 @@ Major features missing:
 Minor features missing:
 
 - Graceful shutdown.
-- Listen on specific interfaces rather than 0.0.0.0.
 - seccomp setup.
 - Running specific code before/after performing a system switch.
+- Better error handling/logging.
 - Plenty of other minor features are missing as well, but those are too much to be listed here right now.
 
 Note: currently this work is not licensed.

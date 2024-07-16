@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, ops::Deref, path::PathBuf};
 
 use anyhow::{anyhow, Context};
 use derive_builder::Builder;
@@ -19,8 +19,7 @@ use tracing::instrument;
 use xz_decoder::XZDecoder;
 
 use crate::{
-    fingerprint::Fingerprint, metrics, owned_nar_info::OwnedNarInfo,
-    path_utils::collect_nix_store_packages,
+    fingerprint::Fingerprint, owned_nar_info::OwnedNarInfo, path_utils::collect_nix_store_packages,
 };
 
 #[derive(Builder)]
@@ -37,29 +36,44 @@ pub enum DownloaderRequest {
         package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<Vec<NarDownloadResult>>>,
     },
+    Shutdown,
 }
 
+#[derive(Debug)]
 pub struct StartedDownloader {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    input_tx: mpsc::Sender<DownloaderRequest>,
+    task: JoinHandle<anyhow::Result<()>>,
+    input: StartedDownloaderInput,
 }
 
 impl StartedDownloader {
-    pub fn child(&self) -> Self {
-        Self {
-            task: None,
-            input_tx: self.input_tx.clone(),
-        }
+    pub fn input(&self) -> StartedDownloaderInput {
+        self.input.clone()
     }
 
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        if let Some(task) = self.task {
-            task.await??;
-        }
+        self.input
+            .input_tx
+            .send(DownloaderRequest::Shutdown)
+            .await?;
 
-        Ok(())
+        self.task.await?
     }
+}
 
+impl Deref for StartedDownloader {
+    type Target = StartedDownloaderInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StartedDownloaderInput {
+    input_tx: mpsc::Sender<DownloaderRequest>,
+}
+
+impl StartedDownloaderInput {
     pub async fn download_packages(
         &self,
         package_ids: HashSet<String>,
@@ -108,8 +122,8 @@ impl Downloader {
         });
 
         StartedDownloader {
-            task: Some(task),
-            input_tx,
+            task,
+            input: StartedDownloaderInput { input_tx },
         }
     }
 }
@@ -199,6 +213,10 @@ async fn downloader_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
+            DownloaderRequest::Shutdown => {
+                tracing::info!("Downloader got request to shutdown. Shutting down.");
+                break;
+            }
             DownloaderRequest::DownloadPackages {
                 package_ids,
                 resp_tx,

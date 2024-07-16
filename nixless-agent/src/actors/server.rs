@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, net::IpAddr};
 
 use actix_web::{
     error::InternalError, http::StatusCode, web, App, Either, HttpRequest, HttpResponse,
@@ -17,6 +17,7 @@ use super::StartedStateKeeperInput;
 #[derive(Builder)]
 #[builder(pattern = "owned")]
 pub struct Server {
+    address: IpAddr,
     port: u16,
     state_keeper_input: StartedStateKeeperInput,
     update_public_key: String,
@@ -50,7 +51,7 @@ impl Server {
         })
         .shutdown_timeout(5)
         .workers(2)
-        .bind(("0.0.0.0", self.port))?
+        .bind((self.address, self.port))?
         .run();
 
         let server_task = tokio::spawn(async { server_task.await });

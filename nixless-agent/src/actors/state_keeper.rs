@@ -89,6 +89,7 @@ enum StateKeeperRequest {
         to_version: Option<u32>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -108,6 +109,14 @@ impl Deref for StartedStateKeeper {
 impl StartedStateKeeper {
     pub fn input(&self) -> StartedStateKeeperInput {
         self.input.clone()
+    }
+
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.input
+            .input_tx
+            .send(StateKeeperRequest::Shutdown)
+            .await?;
+        self.task.await?
     }
 }
 
@@ -215,6 +224,10 @@ async fn state_keeper_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
+            StateKeeperRequest::Shutdown => {
+                tracing::info!("State keeper got a request to shut down. Shutting down.");
+                break;
+            }
             StateKeeperRequest::CleanUpStateDir => {
                 let input_tx_clone = input_tx.clone();
                 let dir = state.base_dir_nix();
@@ -257,7 +270,7 @@ async fn state_keeper_task(
                         state.mark_performing_rollback(to_version).await?;
 
                         let input_tx_clone = input_tx.clone();
-                        let dbus_connection_child = dbus_connection.child();
+                        let dbus_connection_input = dbus_connection.input();
                         // A bit annoying that we have to grab this from agent state, but seems like the better option. There are other ways to structure the code here to allow moving this stuff all inside the agent state so we don't need to clone the agent state or make an Arc or whatever, but I think this is fine for now.
                         let switch_start_file_path = state.absolute_switch_start_time_path();
                         let new_configuration_path = state.new_configuration_system_package_path().unwrap(); // We just marked that we're switching to a new system, so the `unwrap()` should never fail.
@@ -266,7 +279,7 @@ async fn state_keeper_task(
                         resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                         pending_system_switch_task = Some(tokio::spawn(async move {
                             record_switch_start(switch_start_file_path.clone()).unwrap();
-                            match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
+                            match dbus_connection_input.perform_configuration_switch(new_configuration_path).await {
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when performing a system switch for a rollback.");
@@ -307,9 +320,9 @@ async fn state_keeper_task(
                         state.mark_switching_new_system(system_package_id, package_ids.clone())?;
 
                         let input_tx_clone = input_tx.clone();
-                        let downloader_child = downloader.child();
-                        let unpacker_child = unpacker.child();
-                        let dbus_connection_child = dbus_connection.child();
+                        let downloader_input = downloader.input();
+                        let unpacker_input = unpacker.input();
+                        let dbus_connection_input = dbus_connection.input();
                         // A bit annoying that we have to grab this from agent state, but seems like the better option. There are other ways to structure the code here to allow moving this stuff all inside the agent state so we don't need to clone the agent state or make an Arc or whatever, but I think this is fine for now.
                         let switch_start_file_path = state.absolute_switch_start_time_path();
                         let new_configuration_path = state.new_configuration_system_package_path().unwrap(); // We just marked that we're switching to a new system, so the `unwrap()` should never fail.
@@ -318,7 +331,7 @@ async fn state_keeper_task(
                         resp_tx.send(Ok(())).map_err(|_| anyhow!("channel closed before we could send the response"))?;
                         pending_system_switch_task = Some(tokio::spawn(async move {
                             let download_timer = metrics::system::configuration_download_duration(&system_package_id_arc).start_timer();
-                            let res = match downloader_child.download_packages(package_ids).await {
+                            let res = match downloader_input.download_packages(package_ids).await {
                                 Ok(v) => v,
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when downloading packages during system switch.");
@@ -330,7 +343,7 @@ async fn state_keeper_task(
                             tracing::info!(download_duration_secs = download_duration.as_secs_f32(), "Finished downloading new system configuration.");
 
                             let setup_timer = metrics::system::configuration_setup_duration(&system_package_id_arc).start_timer();
-                            match unpacker_child.unpack_downloads(res).await {
+                            match unpacker_input.unpack_downloads(res).await {
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when unpacking downloads during system switch.");
@@ -342,7 +355,7 @@ async fn state_keeper_task(
                             tracing::info!(setup_duration_secs = setup_duration.as_secs_f32(), "Finished unpacking new system configuration.");
 
                             record_switch_start(switch_start_file_path.clone()).unwrap();
-                            match dbus_connection_child.perform_configuration_switch(new_configuration_path).await {
+                            match dbus_connection_input.perform_configuration_switch(new_configuration_path).await {
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when performing a system switch after unpacking all downloads.");
@@ -399,10 +412,10 @@ async fn state_keeper_task(
 
                 if state.has_packages_to_cleanup() {
                     let input_tx_clone = input_tx.clone();
-                    let deleter_clone = deleter.child();
+                    let deleter_input = deleter.input();
                     let packages_to_cleanup = state.packages_to_cleanup();
                     pending_package_delete_task = Some(tokio::spawn(async move {
-                        let res = deleter_clone.delete_packages(packages_to_cleanup).await;
+                        let res = deleter_input.delete_packages(packages_to_cleanup).await;
                         input_tx_clone
                             .send(StateKeeperRequest::PackageDeletionResult(res))
                             .await
@@ -440,6 +453,15 @@ async fn state_keeper_task(
         tracing::info!("We have a pending package deletion task, waiting for it to finish.");
         task.await?;
     }
+
+    let shutdown_results = tokio::join!(
+        downloader.shutdown(),
+        unpacker.shutdown(),
+        dbus_connection.shutdown()
+    );
+    [shutdown_results.0, shutdown_results.1, shutdown_results.2]
+        .into_iter()
+        .collect::<Result<_, _>>()?;
 
     Ok(())
 }

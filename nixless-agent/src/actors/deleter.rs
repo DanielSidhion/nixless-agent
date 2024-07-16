@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, ops::Deref, path::PathBuf};
 
 use anyhow::anyhow;
 use derive_builder::Builder;
@@ -21,29 +21,40 @@ pub enum DeleterRequest {
         package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    Shutdown,
 }
 
+#[derive(Debug)]
 pub struct StartedDeleter {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
+    task: JoinHandle<anyhow::Result<()>>,
+    input: StartedDeleterInput,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartedDeleterInput {
     input_tx: mpsc::Sender<DeleterRequest>,
 }
 
 impl StartedDeleter {
-    pub fn child(&self) -> Self {
-        Self {
-            task: None,
-            input_tx: self.input_tx.clone(),
-        }
+    pub fn input(&self) -> StartedDeleterInput {
+        self.input.clone()
     }
 
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        if let Some(task) = self.task {
-            task.await??;
-        }
-
-        Ok(())
+        self.input.input_tx.send(DeleterRequest::Shutdown).await?;
+        self.task.await?
     }
+}
 
+impl Deref for StartedDeleter {
+    type Target = StartedDeleterInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+impl StartedDeleterInput {
     pub async fn delete_packages(&self, package_ids: HashSet<String>) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -69,8 +80,8 @@ impl Deleter {
         let task = tokio::spawn(deleter_task(self.nix_store_dir, input_rx));
 
         StartedDeleter {
-            task: Some(task),
-            input_tx,
+            task,
+            input: StartedDeleterInput { input_tx },
         }
     }
 }
@@ -86,6 +97,10 @@ async fn deleter_task(
 
     while let Some(req) = input_stream.next().await {
         match req {
+            DeleterRequest::Shutdown => {
+                tracing::info!("Deleter got a request to shutdown. Shutting down.");
+                break;
+            }
             DeleterRequest::DeletePackages {
                 package_ids,
                 resp_tx,

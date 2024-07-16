@@ -1,4 +1,7 @@
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
+};
 
 use actors::{Deleter, Downloader, Server, StateKeeper, Unpacker};
 use anyhow::anyhow;
@@ -11,6 +14,7 @@ use foundations::telemetry::{
     },
 };
 use futures::StreamExt;
+use nix::ifaddrs::getifaddrs;
 use signal_hook::consts::signal;
 use signal_hook_tokio::Signals;
 use state::AgentState;
@@ -31,13 +35,29 @@ mod system_configuration;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Port to listen on.
+    /// Port to listen on for the control server.
     #[arg(long, env = "NIXLESS_AGENT_LISTEN_PORT")]
-    port: u16,
+    control_port: u16,
+
+    /// Interface to listen on for the control server.
+    #[arg(long, env = "NIXLESS_AGENT_CONTROL_LISTEN_IFACE")]
+    control_interface: Option<String>,
+
+    /// Address to listen on for the control server.
+    #[arg(long, env = "NIXLESS_AGENT_CONTROL_LISTEN_ADDRESS")]
+    control_address: Option<String>,
 
     /// Port to listen on to serve metrics and other telemetry insights.
     #[arg(long, env = "NIXLESS_AGENT_TELEMETRY_LISTEN_PORT")]
     telemetry_port: u16,
+
+    /// Interface to listen on for the telemetry server.
+    #[arg(long, env = "NIXLESS_AGENT_TELEMETRY_LISTEN_IFACE")]
+    telemetry_interface: Option<String>,
+
+    /// Address to listen on for the telemetry server.
+    #[arg(long, env = "NIXLESS_AGENT_TELEMETRY_LISTEN_ADDRESS")]
+    telemetry_address: Option<String>,
 
     /// Path to the Nix store.
     #[arg(
@@ -119,7 +139,7 @@ async fn handle_signals(mut signals: Signals) {
     }
 }
 
-fn telemetry_server_settings(telemetry_port: u16) -> TelemetrySettings {
+fn telemetry_server_settings(telemetry_address: IpAddr, telemetry_port: u16) -> TelemetrySettings {
     let mut metrics = MetricsSettings::default();
     metrics.report_optional = true;
 
@@ -131,20 +151,51 @@ fn telemetry_server_settings(telemetry_port: u16) -> TelemetrySettings {
         memory_profiler,
         server: TelemetryServerSettings {
             enabled: true,
-            addr: (Ipv4Addr::UNSPECIFIED, telemetry_port).into(),
+            addr: (telemetry_address, telemetry_port).into(),
         },
     }
 }
 
+pub fn find_interface_ip(interface_name: &str) -> anyhow::Result<IpAddr> {
+    let addrs = getifaddrs()?;
+    let sock: Option<IpAddr> = addrs
+        .filter(|i| i.interface_name == interface_name)
+        .filter_map(|i| match i.address {
+            None => None,
+            Some(ia) if ia.as_sockaddr_in().is_some() => {
+                Some(IpAddr::V4(ia.as_sockaddr_in().unwrap().ip()))
+            }
+            Some(ia) if ia.as_sockaddr_in6().is_some() => {
+                Some(IpAddr::V6(ia.as_sockaddr_in6().unwrap().ip()))
+            }
+            Some(_) => None,
+        })
+        .next();
+
+    sock.ok_or_else(|| anyhow!("the chosen interface doesn't exist or have an IP address"))
+}
+
 #[tokio::main]
 async fn async_main(args: Args) -> anyhow::Result<()> {
+    let control_server_address = match (args.control_address, args.control_interface) {
+        (Some(a), _) => a.parse()?,
+        (None, Some(iface)) => find_interface_ip(&iface)?,
+        (None, None) => "0.0.0.0".parse()?,
+    };
+
+    let telemetry_server_address = match (args.telemetry_address, args.telemetry_interface) {
+        (Some(a), _) => a.parse()?,
+        (None, Some(iface)) => find_interface_ip(&iface)?,
+        (None, None) => "0.0.0.0".parse()?,
+    };
+
     let store_path_string = args.nix_store_dir.canonicalize()?.to_str().ok_or_else(|| anyhow!("The nix store path given to us can't be represented as an UTF-8 string, but this is required!"))?.to_string();
 
     let service_info = foundations::service_info!();
     // TODO: configure graceful shutdown.
     let telemetry_server = init_with_server(
         &service_info,
-        &telemetry_server_settings(args.telemetry_port),
+        &telemetry_server_settings(telemetry_server_address, args.telemetry_port),
         Vec::new(),
     )?;
 
@@ -208,7 +259,8 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         .start();
 
     let server = Server::builder()
-        .port(args.port)
+        .address(control_server_address)
+        .port(args.control_port)
         .state_keeper_input(state_keeper.input())
         .update_public_key(args.update_public_key)
         .build()?
