@@ -1,9 +1,10 @@
 use std::{collections::HashSet, net::IpAddr};
 
 use actix_web::{
-    error::InternalError, http::StatusCode, web, App, Either, HttpRequest, HttpResponse,
-    HttpServer, Responder,
+    dev::ServerHandle, error::InternalError, http::StatusCode, web, App, Either, HttpRequest,
+    HttpResponse, HttpServer, Responder,
 };
+use anyhow::anyhow;
 use derive_builder::Builder;
 use nix_core::{NixStylePublicKey, PublicKeychain};
 use serde_json::json;
@@ -49,21 +50,38 @@ impl Server {
                 )
                 .route("/", web::to(HttpResponse::ImATeapot))
         })
+        .disable_signals()
         .shutdown_timeout(5)
         .workers(2)
         .bind((self.address, self.port))?
         .run();
 
+        let server_handle = server_task.handle();
         let server_task = tokio::spawn(async { server_task.await });
 
         Ok(StartedServer {
-            server_task: Some(server_task),
+            server_task,
+            server_handle,
         })
     }
 }
 
 pub struct StartedServer {
-    server_task: Option<JoinHandle<std::io::Result<()>>>,
+    server_task: JoinHandle<std::io::Result<()>>,
+    server_handle: ServerHandle,
+}
+
+impl StartedServer {
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        tracing::info!(
+            "Control server got a request to shutdown. Proceeding with graceful shutdown."
+        );
+
+        self.server_handle.stop(true).await;
+        self.server_task
+            .await?
+            .map_err(|e| anyhow!("control server encountered an error during shutdown: {}", e))
+    }
 }
 
 #[instrument(skip_all, fields(uri = req.uri().to_string(), method = req.method().as_str()))]

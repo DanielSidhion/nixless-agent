@@ -204,4 +204,31 @@ in
       test_machine.fail("ls -l /etc/third-new-test-machine-tracker")
     '';
   };
+
+  gracefulShutdown = nixosLib.runTest {
+    name = "gracefulShutdown";
+    hostPkgs = pkgs;
+    globalTimeout = 120;
+
+    nodes = {
+      binary_cache = binaryCacheNode;
+      test_machine = testMachineNode;
+    };
+
+    includeTestScriptReferences = false; # If this is left at the default of `true`, the test machine will end up with a local copy of the new configuration already, because it uses its own Nix store and the testing infrastructure will put the closure of the test script inside that Nix store.
+    testScript = ''
+      binary_cache.start()
+      binary_cache.wait_for_unit("nix-serve.service")
+
+      test_machine.start(True)
+      test_machine.wait_for_unit("nixless-agent.service")
+
+      binary_cache.wait_until_succeeds("curl -N http://test_machine:56321/summary | ${lib.getExe pkgs.jq} -e '.status == \"standby\"'", 20000)
+      binary_cache.succeed("curl -N http://test_machine:56432/metrics | grep -q 'nixless_agent_system_version 0'")
+
+      test_machine.systemctl("stop nixless-agent")
+      test_machine.wait_until_fails("systemctl status nixless-agent", 20000)
+      test_machine.succeed("journalctl -u nixless-agent --no-pager | grep -q 'Process done with graceful shutdown'")
+    '';
+  };
 }

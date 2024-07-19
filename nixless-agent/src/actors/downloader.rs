@@ -214,7 +214,7 @@ async fn downloader_task(
     while let Some(req) = input_stream.next().await {
         match req {
             DownloaderRequest::Shutdown => {
-                tracing::info!("Downloader got request to shutdown. Shutting down.");
+                tracing::info!("Downloader got request to shutdown. Proceeding.");
                 break;
             }
             DownloaderRequest::DownloadPackages {
@@ -306,6 +306,7 @@ async fn downloader_task(
         }
     }
 
+    tracing::info!("Downloader has finished shutting down.");
     Ok(())
 }
 

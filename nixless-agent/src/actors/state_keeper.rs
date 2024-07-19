@@ -457,12 +457,19 @@ async fn state_keeper_task(
     let shutdown_results = tokio::join!(
         downloader.shutdown(),
         unpacker.shutdown(),
-        dbus_connection.shutdown()
+        dbus_connection.shutdown(),
+        deleter.shutdown(),
     );
-    [shutdown_results.0, shutdown_results.1, shutdown_results.2]
-        .into_iter()
-        .collect::<Result<_, _>>()?;
+    [
+        shutdown_results.0,
+        shutdown_results.1,
+        shutdown_results.2,
+        shutdown_results.3,
+    ]
+    .into_iter()
+    .collect::<Result<_, _>>()?;
 
+    tracing::info!("State keeper has finished shutting down.");
     Ok(())
 }
 

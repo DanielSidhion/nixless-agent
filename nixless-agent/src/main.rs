@@ -1,26 +1,16 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::PathBuf,
-};
+use std::{net::IpAddr, path::PathBuf};
 
 use actors::{Deleter, Downloader, Server, StateKeeper, Unpacker};
 use anyhow::anyhow;
 use clap::Parser;
 use dbus_connection::DBusConnection;
-use foundations::telemetry::{
-    init_with_server,
-    settings::{
-        MemoryProfilerSettings, MetricsSettings, TelemetryServerSettings, TelemetrySettings,
-    },
-};
 use futures::StreamExt;
 use nix::ifaddrs::getifaddrs;
 use signal_hook::consts::signal;
 use signal_hook_tokio::Signals;
 use state::AgentState;
-use tracing::info;
 
-use crate::process_init::ensure_nix_daemon_not_present;
+use crate::{process_init::ensure_nix_daemon_not_present, telemetry::TelemetryServer};
 
 mod actors;
 mod dbus_connection;
@@ -31,6 +21,7 @@ mod path_utils;
 mod process_init;
 mod state;
 mod system_configuration;
+mod telemetry;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -130,29 +121,11 @@ async fn handle_signals(mut signals: Signals) {
                 // Reload configuration
                 // Reopen the log file
             }
-            signal::SIGTERM | signal::SIGINT | signal::SIGQUIT => {
-                // Shutdown the system;
+            signal::SIGTERM => {
                 break;
             }
             _ => unreachable!(),
         }
-    }
-}
-
-fn telemetry_server_settings(telemetry_address: IpAddr, telemetry_port: u16) -> TelemetrySettings {
-    let mut metrics = MetricsSettings::default();
-    metrics.report_optional = true;
-
-    let mut memory_profiler = MemoryProfilerSettings::default();
-    memory_profiler.enabled = true;
-
-    TelemetrySettings {
-        metrics,
-        memory_profiler,
-        server: TelemetryServerSettings {
-            enabled: true,
-            addr: (telemetry_address, telemetry_port).into(),
-        },
     }
 }
 
@@ -191,29 +164,18 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
 
     let store_path_string = args.nix_store_dir.canonicalize()?.to_str().ok_or_else(|| anyhow!("The nix store path given to us can't be represented as an UTF-8 string, but this is required!"))?.to_string();
 
-    let service_info = foundations::service_info!();
-    // TODO: configure graceful shutdown.
-    let telemetry_server = init_with_server(
-        &service_info,
-        &telemetry_server_settings(telemetry_server_address, args.telemetry_port),
-        Vec::new(),
-    )?;
-
-    if let Some(addr) = telemetry_server.server_addr() {
-        tracing::info!(%addr, "Telemetry server has started.");
-    }
-
-    let telemetry_server_task = tokio::spawn(async move {
-        telemetry_server.await.unwrap();
-    });
-
     let signals = Signals::new(&[
+        // Used when asked to reload configuration files by systemd.
         signal::SIGHUP,
+        // Used when asked to terminate by systemd.
         signal::SIGTERM,
-        signal::SIGINT,
-        signal::SIGQUIT,
     ])?;
     let signals_task = tokio::spawn(handle_signals(signals));
+
+    let telemetry_server = TelemetryServer::builder()
+        .address(telemetry_server_address)
+        .port(args.telemetry_port)
+        .start()?;
 
     let state = AgentState::from_saved_state_or_new(
         store_path_string.clone(),
@@ -267,14 +229,18 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         .start()?;
 
     signals_task.await?;
-
+    tracing::info!("Process was asked to terminate, proceeding with graceful shutdown.");
+    server.shutdown().await?;
+    state_keeper.shutdown().await?;
+    telemetry_server.shutdown().await?;
+    tracing::info!("Process done with graceful shutdown.");
     Ok(())
 }
 
 // Main is not async because we need to make sure we deal with all the capabilities on the initial thread before we spawn any others.
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    info!("nixless-agent finished initialising logging, will now proceed with the rest of initialisation.");
+    tracing::info!("nixless-agent finished initialising logging, will now proceed with the rest of initialisation.");
     process_init::load_extra_env_file()?;
     let args = Args::parse();
 

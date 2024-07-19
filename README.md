@@ -13,7 +13,7 @@ Major features missing:
 
 Minor features missing:
 
-- Graceful shutdown.
+- Integrate with systemd's notify instead of the exec type.
 - seccomp setup.
 - Running specific code before/after performing a system switch.
 - Better error handling/logging.

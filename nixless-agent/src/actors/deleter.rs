@@ -98,7 +98,7 @@ async fn deleter_task(
     while let Some(req) = input_stream.next().await {
         match req {
             DeleterRequest::Shutdown => {
-                tracing::info!("Deleter got a request to shutdown. Shutting down.");
+                tracing::info!("Deleter got a request to shutdown. Proceeding.");
                 break;
             }
             DeleterRequest::DeletePackages {
@@ -129,5 +129,6 @@ async fn deleter_task(
         }
     }
 
+    tracing::info!("Deleter has finished shutting down.");
     Ok(())
 }

@@ -107,7 +107,7 @@ async fn unpacker_task(
     while let Some(req) = input_stream.next().await {
         match req {
             UnpackerRequest::Shutdown => {
-                tracing::info!("Unpacker got a request to shutdown. Shutting down.");
+                tracing::info!("Unpacker got a request to shutdown. Proceeding.");
                 break;
             }
             UnpackerRequest::UnpackDownloads { downloads, resp_tx } => {
@@ -135,6 +135,7 @@ async fn unpacker_task(
         }
     }
 
+    tracing::info!("Unpacked has finished shutting down.");
     Ok(())
 }
 

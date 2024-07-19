@@ -162,7 +162,7 @@ async fn dbus_connection_task(
     while let Some(req) = input_stream.next().await {
         match req {
             DBusConnectionRequest::Shutdown => {
-                tracing::info!("D-Bus connection got a request to shut down. Shutting down.");
+                tracing::info!("D-Bus connection got a request to shut down. Proceeding.");
                 break;
             }
             DBusConnectionRequest::CheckAuthorisationPossibility { resp_tx } => {
@@ -200,7 +200,7 @@ async fn dbus_connection_task(
 
     tracing::info!("D-Bus connection task exited its main loop, will now abort the connection to the system bus.");
     dbus_task.abort();
-
+    tracing::info!("D-Bus connection has finished shutting down.");
     Ok(())
 }
 
