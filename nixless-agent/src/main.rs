@@ -6,6 +6,7 @@ use clap::Parser;
 use dbus_connection::DBusConnection;
 use futures::StreamExt;
 use nix::ifaddrs::getifaddrs;
+use process_init::SystemdNotifyHandle;
 use signal_hook::consts::signal;
 use signal_hook_tokio::Signals;
 use state::AgentState;
@@ -149,7 +150,7 @@ pub fn find_interface_ip(interface_name: &str) -> anyhow::Result<IpAddr> {
 }
 
 #[tokio::main]
-async fn async_main(args: Args) -> anyhow::Result<()> {
+async fn async_main(args: Args, systemd_handle: SystemdNotifyHandle) -> anyhow::Result<()> {
     let control_server_address = match (args.control_address, args.control_interface) {
         (Some(a), _) => a.parse()?,
         (None, Some(iface)) => find_interface_ip(&iface)?,
@@ -228,7 +229,9 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         .build()?
         .start()?;
 
+    systemd_handle.notify_ready()?;
     signals_task.await?;
+
     tracing::info!("Process was asked to terminate, proceeding with graceful shutdown.");
     server.shutdown().await?;
     state_keeper.shutdown().await?;
@@ -241,6 +244,9 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("nixless-agent finished initialising logging, will now proceed with the rest of initialisation.");
+
+    let systemd_handle = process_init::retrieve_once_systemd_notify_handle();
+
     process_init::load_extra_env_file()?;
     let args = Args::parse();
 
@@ -250,5 +256,5 @@ fn main() -> anyhow::Result<()> {
     process_init::prepare_nix_state(&args.nix_state_dir)?;
     process_init::drop_caps()?;
 
-    async_main(args)
+    async_main(args, systemd_handle)
 }

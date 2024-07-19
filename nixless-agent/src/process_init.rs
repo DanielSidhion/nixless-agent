@@ -1,7 +1,8 @@
 use std::{
+    env,
     fs::{read_dir, read_link, read_to_string},
     io::ErrorKind,
-    os::unix::fs::lchown,
+    os::unix::{fs::lchown, net::UnixDatagram},
     path::{Path, PathBuf},
 };
 
@@ -159,7 +160,7 @@ pub fn ensure_nix_daemon_not_present() -> anyhow::Result<()> {
                 Err(_) => {
                     let cmdline_contents = match read_to_string(path.join("cmdline")) {
                         Ok(v) => v,
-                        Err(err) => {
+                        Err(_err) => {
                             // No exe or cmdline found for this proc! Will skip it, there's not much we can do.
                             continue;
                         }
@@ -205,4 +206,36 @@ pub fn load_extra_env_file() -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+pub struct SystemdNotifyHandle {
+    socket_path: Option<String>,
+}
+
+impl SystemdNotifyHandle {
+    pub fn notify_ready(&self) -> std::io::Result<()> {
+        if self.socket_path.is_none() {
+            return Ok(());
+        }
+
+        let msg = "READY=1\n";
+        let sock = UnixDatagram::unbound()?;
+        let len = sock.send_to(msg.as_bytes(), self.socket_path.as_ref().unwrap())?;
+
+        if len != msg.len() {
+            Err(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "incomplete write",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn retrieve_once_systemd_notify_handle() -> SystemdNotifyHandle {
+    let socket_path = env::var_os("NOTIFY_SOCKET").map(|s| s.into_string().unwrap());
+    env::remove_var("NOTIFY_SOCKET");
+
+    SystemdNotifyHandle { socket_path }
 }

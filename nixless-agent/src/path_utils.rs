@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::anyhow;
 use futures::future::join_all;
-use nix::unistd::{chown, getegid, geteuid};
+use nix::unistd::geteuid;
 use tracing::instrument;
 
 pub fn get_number_from_numbered_system_name(name: &OsStr) -> anyhow::Result<u32> {

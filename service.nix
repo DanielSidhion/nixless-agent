@@ -121,6 +121,8 @@ in
         };
 
         serviceConfig = {
+          Type = "notify";
+          NotifyAccess = "main";
           ExecStart = lib.getExe cfg.package;
           CapabilityBoundingSet = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
           AmbientCapabilities = "CAP_SYS_ADMIN CAP_CHOWN CAP_SETPCAP CAP_FOWNER";
