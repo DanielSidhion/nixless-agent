@@ -79,7 +79,7 @@ enum StateKeeperRequest {
         package_ids: HashSet<String>,
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
-    ConfigurationSwitchResult(anyhow::Result<()>),
+    ConfigurationSwitchStartResult(anyhow::Result<()>),
     CleanupConfigurationHistory,
     PackageDeletionResult(anyhow::Result<()>),
     GetSummary {
@@ -208,9 +208,8 @@ async fn state_keeper_task(
                 .await?;
         }
         AgentStateStatus::SwitchingToConfiguration { .. } => {
-            // TODO: rename `ConfigurationSwitchResult` to something different, because it's not the result of actually making the configuration switch, but the result of "starting" the switch.
             input_tx
-                .send(StateKeeperRequest::ConfigurationSwitchResult(Ok(())))
+                .send(StateKeeperRequest::ConfigurationSwitchStartResult(Ok(())))
                 .await
                 .unwrap();
         }
@@ -234,7 +233,6 @@ async fn state_keeper_task(
                 tracing::info!("Starting a task to clean up the Nix state dir.");
                 pending_clean_up_task = Some(tokio::spawn(async move {
                     let res = clean_up_nix_var_dir(dir).await;
-                    // TODO: deal with error when sending the result back.
                     input_tx_clone
                         .send(StateKeeperRequest::CleanUpStateDirResult(res))
                         .await
@@ -283,13 +281,13 @@ async fn state_keeper_task(
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when performing a system switch for a rollback.");
-                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Err(err))).await.unwrap();
                                     return;
                                 }
                             }
 
                             // We'll check if system switch was made successfully inside the state keeper code instead of this ad-hoc task.
-                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Ok(()))).await.unwrap();
+                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Ok(()))).await.unwrap();
                         }));
                     }
                 }
@@ -335,7 +333,7 @@ async fn state_keeper_task(
                                 Ok(v) => v,
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when downloading packages during system switch.");
-                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Err(err))).await.unwrap();
                                     return;
                                 },
                             };
@@ -347,7 +345,7 @@ async fn state_keeper_task(
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when unpacking downloads during system switch.");
-                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Err(err))).await.unwrap();
                                     return;
                                 }
                             };
@@ -359,18 +357,18 @@ async fn state_keeper_task(
                                 Ok(()) => (),
                                 Err(err) => {
                                     tracing::error!(?err, "Got an error when performing a system switch after unpacking all downloads.");
-                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Err(err))).await.unwrap();
+                                    input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Err(err))).await.unwrap();
                                     return;
                                 }
                             }
 
                             // We'll check if system switch was made successfully inside the state keeper code instead of this ad-hoc task.
-                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchResult(Ok(()))).await.unwrap();
+                            input_tx_clone.send(StateKeeperRequest::ConfigurationSwitchStartResult(Ok(()))).await.unwrap();
                         }));
                     }
                 }
             }
-            StateKeeperRequest::ConfigurationSwitchResult(Err(err)) => {
+            StateKeeperRequest::ConfigurationSwitchStartResult(Err(err)) => {
                 pending_system_switch_task = None;
 
                 let switch_duration =
@@ -385,7 +383,7 @@ async fn state_keeper_task(
                     "Failed to switch to new system configuration."
                 );
             }
-            StateKeeperRequest::ConfigurationSwitchResult(Ok(())) => {
+            StateKeeperRequest::ConfigurationSwitchStartResult(Ok(())) => {
                 tracing::info!("Configuration switch was successful!");
                 wait_for_system_update_and_update_state(&mut state, &dbus_connection).await?;
                 pending_system_switch_task = None;
@@ -445,8 +443,8 @@ async fn state_keeper_task(
     }
 
     if let Some(task) = pending_system_switch_task {
-        tracing::info!("We have a pending system switch task, waiting for it to finish.");
-        task.await?;
+        tracing::info!("We have a pending system switch task, but we'll abort it because it could be the task getting us to shut down.");
+        task.abort();
     }
 
     if let Some(task) = pending_package_delete_task {
@@ -489,7 +487,6 @@ async fn wait_for_system_update_and_update_state(
             SystemSwitchStatus::InProgress => {
                 dbus_connection.wait_configuration_switch_complete().await?;
                 // After the wait, we'll continue through the loop so we can evaluate the results once again.
-                // TODO: detect when we're stuck in an infinite loop and bail.
             }
             SystemSwitchStatus::Failed(_) => {
                 state.mark_new_system_failed().await?;

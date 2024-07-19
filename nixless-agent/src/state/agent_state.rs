@@ -351,7 +351,7 @@ impl AgentState {
         if let AgentStateStatus::SwitchingToConfiguration { .. } = &self.current_status {
             let previous_status =
                 std::mem::replace(&mut self.current_status, AgentStateStatus::Standby);
-            // TODO: if the configuration that we switched to is the same as the latest configuration in `self.system_configurations` (this can happen in case of a rollback after a failed switch), should we just change the version number of the config that exists in `self.system_configurations` instead of adding another entry there?
+            // TODO: if the configuration that we switched to is the same as the latest configuration in `self.system_configurations` (this can happen in case of a rollback after a failed switch), should we just change the version number of the config that exists in `self.system_configurations` instead of adding another entry there? Or perhaps mark it as a rollback and not count it against the max number of configurations?
             self.system_configurations
                 .push(previous_status.into_inner_configuration().unwrap());
             self.save()?;

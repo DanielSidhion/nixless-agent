@@ -98,7 +98,6 @@ fn prepare_nix_state_dir(curr_dir_path: &Path, gid: &Gid) -> anyhow::Result<()> 
 
 pub fn drop_caps() -> anyhow::Result<()> {
     // We'll still need CAP_CHOWN when unpacking NARs into the store, but the other caps can go away.
-    // TODO: optimise this into fewer calls.
     caps::clear(None, CapSet::Ambient)?;
     caps::clear(None, CapSet::Inheritable)?;
     caps::drop(None, CapSet::Effective, Capability::CAP_SYS_ADMIN)?;

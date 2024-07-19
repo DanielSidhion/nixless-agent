@@ -100,6 +100,7 @@ struct Args {
     )]
     relative_configuration_activation_command: PathBuf,
 
+    /// The maximum number of system configurations that will be kept in the agent's state for rollbacks.
     #[arg(long, default_value_t = 3, env = "NIXLESS_MAX_SYSTEM_HISTORY_COUNT")]
     max_system_history_count: usize,
 
@@ -113,6 +114,10 @@ struct Args {
     /// - <result_code>, <exit_code>, and <exit_status> are passed through from systemd.
     #[arg(long, env = "NIXLESS_AGENT_ABSOLUTE_ACTIVATION_TRACKER_COMMAND")]
     absolute_activation_tracker_command: PathBuf, // TODO: figure out a better way to handle this.
+
+    /// The agent will download NAR files for new configurations. This setting controls the maximum number of parallel downloads.
+    #[arg(long, default_value_t = 5, env = "NIXLESS_MAX_PARALLEL_NAR_DOWNLOADS")]
+    max_parallel_nar_downloads: usize,
 }
 
 async fn handle_signals(mut signals: Signals) {
@@ -178,6 +183,8 @@ async fn async_main(args: Args, systemd_handle: SystemdNotifyHandle) -> anyhow::
         .port(args.telemetry_port)
         .start()?;
 
+    let nar_info_cache_dir = args.nixless_state_dir.join("nar_info_cache");
+
     let state = AgentState::from_saved_state_or_new(
         store_path_string.clone(),
         args.nix_state_dir,
@@ -199,6 +206,8 @@ async fn async_main(args: Args, systemd_handle: SystemdNotifyHandle) -> anyhow::
         .cache_url(args.cache_url)
         .cache_auth_token(args.cache_auth_token)
         .cache_public_key(args.cache_public_key)
+        .max_parallel_nar_downloads(args.max_parallel_nar_downloads)
+        .nar_info_cache_dir(nar_info_cache_dir.clone())
         .build()?;
     let downloader = downloader.start();
 
@@ -209,6 +218,7 @@ async fn async_main(args: Args, systemd_handle: SystemdNotifyHandle) -> anyhow::
 
     let deleter = Deleter::builder()
         .nix_store_dir(args.nix_store_dir.clone())
+        .nar_info_cache_dir(nar_info_cache_dir)
         .build()?;
     let deleter = deleter.start();
 

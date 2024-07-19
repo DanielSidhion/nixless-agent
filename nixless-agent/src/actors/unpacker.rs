@@ -135,7 +135,7 @@ async fn unpacker_task(
         }
     }
 
-    tracing::info!("Unpacked has finished shutting down.");
+    tracing::info!("Unpacker has finished shutting down.");
     Ok(())
 }
 

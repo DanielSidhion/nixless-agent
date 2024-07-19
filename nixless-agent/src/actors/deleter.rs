@@ -14,6 +14,7 @@ use crate::path_utils::remove_readonly_path;
 #[derive(Builder)]
 pub struct Deleter {
     nix_store_dir: PathBuf,
+    nar_info_cache_dir: PathBuf,
 }
 
 pub enum DeleterRequest {
@@ -77,7 +78,11 @@ impl Deleter {
     pub fn start(self) -> StartedDeleter {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(deleter_task(self.nix_store_dir, input_rx));
+        let task = tokio::spawn(deleter_task(
+            self.nix_store_dir,
+            self.nar_info_cache_dir,
+            input_rx,
+        ));
 
         StartedDeleter {
             task,
@@ -89,6 +94,7 @@ impl Deleter {
 #[instrument(skip_all)]
 async fn deleter_task(
     nix_store_dir: PathBuf,
+    nar_info_cache_dir: PathBuf,
     input_rx: mpsc::Receiver<DeleterRequest>,
 ) -> anyhow::Result<()> {
     let mut input_stream = ReceiverStream::new(input_rx);
@@ -106,16 +112,30 @@ async fn deleter_task(
                 resp_tx,
             } => {
                 let nix_store_dir_clone = nix_store_dir.clone();
+                let nar_info_cache_dir_clone = nar_info_cache_dir.clone();
                 // Enclosed in a new task so we can easily catch any errors.
                 let delete_task = tokio::spawn(async move {
                     for package_id in package_ids {
-                        let package_path = nix_store_dir_clone.join(package_id);
+                        let package_path = nix_store_dir_clone.join(&package_id);
 
                         if !package_path.exists() {
                             continue;
                         }
 
-                        remove_readonly_path(package_path).await?;
+                        let cached_nar_info_path = package_id
+                            .split_once("-")
+                            .map(|(hash, _name)| nar_info_cache_dir_clone.join(hash))
+                            .filter(|p| p.exists());
+
+                        if let Some(cached_nar_info_path) = cached_nar_info_path {
+                            let res = tokio::join!(
+                                remove_readonly_path(package_path),
+                                remove_readonly_path(cached_nar_info_path)
+                            );
+                            [res.0, res.1].into_iter().collect::<Result<_, _>>()?;
+                        } else {
+                            remove_readonly_path(package_path).await?;
+                        }
                     }
 
                     Ok(())

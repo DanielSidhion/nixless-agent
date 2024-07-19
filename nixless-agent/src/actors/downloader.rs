@@ -1,4 +1,8 @@
-use std::{collections::HashSet, ops::Deref, path::PathBuf};
+use std::{
+    collections::HashSet,
+    ops::Deref,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Context};
 use derive_builder::Builder;
@@ -29,6 +33,8 @@ pub struct Downloader {
     cache_url: String,
     cache_auth_token: Option<String>,
     cache_public_key: Option<String>,
+    max_parallel_nar_downloads: usize,
+    nar_info_cache_dir: PathBuf,
 }
 
 pub enum DownloaderRequest {
@@ -99,13 +105,15 @@ impl Downloader {
     pub fn start(self) -> StartedDownloader {
         let (input_tx, input_rx) = mpsc::channel(10);
 
-        let task = tokio::spawn(async {
+        let task = tokio::spawn(async move {
             match downloader_task(
                 self.nix_store_dir,
                 self.temp_download_path,
                 self.cache_url,
                 self.cache_auth_token,
                 self.cache_public_key,
+                self.max_parallel_nar_downloads,
+                self.nar_info_cache_dir,
                 input_rx,
             )
             .await
@@ -135,6 +143,8 @@ async fn downloader_task(
     cache_url: String,
     cache_auth_token: Option<String>,
     cache_public_key: Option<String>,
+    max_parallel_nar_downloads: usize,
+    nar_info_cache_dir: PathBuf,
     input_rx: mpsc::Receiver<DownloaderRequest>,
 ) -> anyhow::Result<()> {
     let mut keychain = PublicKeychain::with_known_keys()?;
@@ -207,6 +217,10 @@ async fn downloader_task(
         ));
     }
 
+    if !nar_info_cache_dir.exists() {
+        tokio::fs::create_dir(&nar_info_cache_dir).await?;
+    }
+
     tracing::info!("Downloader has finished initialisation and will now enter its main loop.");
 
     let mut input_stream = ReceiverStream::new(input_rx);
@@ -233,6 +247,7 @@ async fn downloader_task(
                     download_futures.push(download_one_nar(
                         client.clone(),
                         &temp_download_path,
+                        &nar_info_cache_dir,
                         &cache_url,
                         package_id,
                         &keychain,
@@ -247,9 +262,8 @@ async fn downloader_task(
 
                 let download_futures = futures::stream::iter(download_futures);
                 // We need to collect from the stream into a Vec of Results first, because the stream doesn't allow us to directly convert from a Vec of Results into a Result of Vec.
-                // TODO: make number of parallel downloads configurable.
                 let mut download_results: Result<Vec<_>, _> = download_futures
-                    .buffer_unordered(5)
+                    .buffer_unordered(max_parallel_nar_downloads)
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
@@ -257,16 +271,20 @@ async fn downloader_task(
 
                 tracing::info!("Finished downloading all missing packages.");
 
-                // We'll augment the download results with the store packages we already had. This is not that efficient because we have to re-fetch the NAR info for the packages we already have.
-                // TODO: make this code more efficient by saving the references for the NARs we download locally so we can load them here instead of fetching from the binary cache again. The references can be cleaned up once the system download operation completes and we verify all references are downloaded.
+                // We'll augment the download results with the store packages we already had. The NAR info should already be cached locally, so this step should be fast. If for some reason they're not cached, we'll re-fetch from the binary cache.
                 if let Ok(ref mut curr_download_results) = download_results {
                     tracing::info!(
                         "Augmenting download results with all packages we already had locally."
                     );
 
                     for existing_package_id in existing_package_ids {
-                        let nar_info =
-                            download_nar_info(&client, &cache_url, &existing_package_id).await?;
+                        let nar_info = cached_download_nar_info(
+                            &client,
+                            &nar_info_cache_dir,
+                            &cache_url,
+                            &existing_package_id,
+                        )
+                        .await?;
                         curr_download_results.push(NarDownloadResult {
                             package_id: existing_package_id,
                             nar_path: temp_download_path.join(nar_info.url),
@@ -320,11 +338,13 @@ pub struct NarDownloadResult {
 async fn download_one_nar(
     client: reqwest::Client,
     download_dir: &PathBuf,
+    nar_info_cache_dir: &Path,
     cache_url: &str,
     package_id: String,
     keychain: &PublicKeychain,
 ) -> anyhow::Result<NarDownloadResult> {
-    let nar_info = download_nar_info(&client, cache_url, &package_id).await?;
+    let nar_info =
+        cached_download_nar_info(&client, nar_info_cache_dir, cache_url, &package_id).await?;
 
     let nar_hash_parts: Vec<_> = nar_info.nar_hash.split(":").collect();
     let ["sha256", nar_hash] = nar_hash_parts[..] else {
@@ -457,14 +477,22 @@ async fn download_one_nar(
     }
 }
 
-async fn download_nar_info(
+async fn cached_download_nar_info(
     client: &reqwest::Client,
+    nar_info_cache_dir: &Path,
     cache_url: &str,
     package_id: &str,
 ) -> anyhow::Result<OwnedNarInfo> {
     let narinfo_url: String;
+    let cached_path: PathBuf;
 
     if let Some((hash, _name)) = package_id.split_once("-") {
+        cached_path = nar_info_cache_dir.join(hash);
+
+        if cached_path.exists() {
+            return parse_nar_info(&tokio::fs::read_to_string(cached_path).await?, package_id);
+        }
+
         narinfo_url = format!("{}/{}.narinfo", cache_url, hash);
     } else {
         return Err(anyhow!(
@@ -491,8 +519,13 @@ async fn download_nar_info(
         ));
     }
 
+    tokio::fs::write(&cached_path, &nar_info_text).await?;
+    parse_nar_info(&nar_info_text, package_id)
+}
+
+fn parse_nar_info(contents: &str, package_id: &str) -> anyhow::Result<OwnedNarInfo> {
     let nar_info =
-        NarInfo::parse(&nar_info_text).map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
+        NarInfo::parse(&contents).map_err(|parsing_error| anyhow!("{:#?}", parsing_error))?;
 
     if !nar_info.store_path.ends_with(&package_id) {
         return Err(anyhow!(

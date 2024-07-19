@@ -30,9 +30,11 @@ impl DBusConnection {
     pub fn start(self) -> StartedDBusConnection {
         let (input_tx, input_rx) = mpsc::channel(10);
 
+        let input_tx_clone = input_tx.clone();
         let task = tokio::spawn(async {
             match dbus_connection_task(
                 input_rx,
+                input_tx_clone,
                 self.relative_configuration_activation_command,
                 self.absolute_activation_tracker_command,
                 self.activation_track_dir,
@@ -136,11 +138,13 @@ pub enum DBusConnectionRequest {
     WaitConfigurationSwitchComplete {
         resp_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    ClearPendingSwitchTask,
     Shutdown,
 }
 
 async fn dbus_connection_task(
     input_rx: mpsc::Receiver<DBusConnectionRequest>,
+    input_tx: mpsc::Sender<DBusConnectionRequest>,
     relative_configuration_activation_command: PathBuf,
     absolute_activation_tracker_command: PathBuf,
     activation_track_dir: PathBuf,
@@ -159,11 +163,21 @@ async fn dbus_connection_task(
         "D-Bus connection has finished initialisation and will now enter its main loop."
     );
 
+    let mut pending_switch_task: Option<JoinHandle<anyhow::Result<()>>> = None;
+
     while let Some(req) = input_stream.next().await {
         match req {
             DBusConnectionRequest::Shutdown => {
                 tracing::info!("D-Bus connection got a request to shut down. Proceeding.");
                 break;
+            }
+            DBusConnectionRequest::ClearPendingSwitchTask => {
+                if pending_switch_task.is_none() {
+                    tracing::error!("D-Bus connection got a request to clear pending configuration switch task, but it's already cleared!");
+                    continue;
+                }
+
+                pending_switch_task = None;
             }
             DBusConnectionRequest::CheckAuthorisationPossibility { resp_tx } => {
                 let res = check_polkit_authorised(conn.clone()).await;
@@ -175,19 +189,36 @@ async fn dbus_connection_task(
                 system_package_path,
                 resp_tx,
             } => {
+                if pending_switch_task.is_some() {
+                    tracing::error!("D-Bus connection got a request to perform a configuration switch while performing a configuration switch already! This should've never happened.");
+                    panic!("Got a request to perform configuration switch in the middle of a configuration switch");
+                }
+
                 let activation_command_path =
                     system_package_path.join(&relative_configuration_activation_command);
 
-                let res = perform_configuration_switch(
-                    conn.clone(),
-                    activation_command_path,
-                    &absolute_activation_tracker_command,
-                    &activation_track_dir,
-                )
-                .await;
-                resp_tx
-                    .send(res)
-                    .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                let conn_clone = conn.clone();
+                let absolute_activation_tracker_command_clone =
+                    absolute_activation_tracker_command.clone();
+                let activation_track_dir_clone = activation_track_dir.clone();
+                let input_tx_clone = input_tx.clone();
+                pending_switch_task = Some(tokio::spawn(async move {
+                    let res = perform_configuration_switch(
+                        conn_clone,
+                        activation_command_path,
+                        &absolute_activation_tracker_command_clone,
+                        &activation_track_dir_clone,
+                    )
+                    .await;
+                    resp_tx
+                        .send(res)
+                        .map_err(|_| anyhow!("channel closed before we could send the response"))?;
+                    input_tx_clone
+                        .send(DBusConnectionRequest::ClearPendingSwitchTask)
+                        .await
+                        .unwrap();
+                    Ok(())
+                }));
             }
             DBusConnectionRequest::WaitConfigurationSwitchComplete { resp_tx } => {
                 let res = wait_configuration_switch_complete(conn.clone()).await;
@@ -198,7 +229,14 @@ async fn dbus_connection_task(
         }
     }
 
-    tracing::info!("D-Bus connection task exited its main loop, will now abort the connection to the system bus.");
+    tracing::info!("D-Bus connection task exited its main loop, will proceed shutting down.");
+
+    if let Some(task) = pending_switch_task {
+        tracing::info!("D-Bus connection task had a pending configuration switch task. Will abort it because it could be the task that caused the shut down to happen.");
+        task.abort();
+    }
+
+    tracing::info!("Will now abort the connection to the system bus.");
     dbus_task.abort();
     tracing::info!("D-Bus connection has finished shutting down.");
     Ok(())
